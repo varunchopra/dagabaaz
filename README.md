@@ -1,6 +1,6 @@
 # dagabaaz
 
-A Python library that runs multi-step workflows as directed acyclic graphs. You define the steps and their dependencies; the engine handles scheduling, data routing, and failures.
+A Python library that orchestrates multi-step workflows as directed acyclic graphs. You define the steps and their dependencies; the engine handles scheduling, data routing, and failures.
 
 ```
 pip install dagabaaz
@@ -90,6 +90,7 @@ callbacks = OrchestratorCallbacks(
     on_run_completed=lambda run_id: print(f"Run {run_id} done"),
     on_run_failed=lambda run_id: print(f"Run {run_id} failed"),
     on_run_crashed=lambda run_id: print(f"Run {run_id} crashed"),
+    on_run_cancelled=lambda run_id: print(f"Run {run_id} cancelled"),
 )
 
 on_task_complete(
