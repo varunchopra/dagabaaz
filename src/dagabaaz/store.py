@@ -159,10 +159,6 @@ class DagStore(Protocol):
         """
         ...
 
-    def fail_run(self, run_id: str, error: str) -> bool:
-        """Claim terminal FAILED + cancel remaining tasks. Returns True if claimed."""
-        ...
-
     def mark_task_failed(self, task_id: str, error: str) -> str | None:
         """Mark a task as failed. Returns the run_id, or None if not found."""
         ...

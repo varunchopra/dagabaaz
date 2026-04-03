@@ -10,6 +10,9 @@ Key algorithms:
 - Fan modes: SINGLE dispatches one task per artifact (with a max fan-out
   guard of 200). AGGREGATE dispatches one task for all artifacts. GROUPED
   dispatches one task per origin group.
+- External termination: ``abort_run`` terminates a run from outside the
+  normal task lifecycle (e.g. run-level deadline, user cancellation).
+  For task-level timeouts, use ``on_task_failed`` instead.
 """
 
 import logging
@@ -48,6 +51,9 @@ OnRunFailed = Callable[[str], None]
 OnRunCrashed = Callable[[str], None]
 """Called when a run crashes (infra failure). Receives run_id."""
 
+OnRunCancelled = Callable[[str], None]
+"""Called when a run is cancelled externally. Receives run_id."""
+
 
 @dataclass(frozen=True, slots=True)
 class OrchestratorCallbacks:
@@ -56,6 +62,7 @@ class OrchestratorCallbacks:
     on_run_completed: OnRunCompleted
     on_run_failed: OnRunFailed
     on_run_crashed: OnRunCrashed
+    on_run_cancelled: OnRunCancelled
 
 
 @dataclass(frozen=True, slots=True)
@@ -490,3 +497,40 @@ def on_task_crashed(
     _evict_topology(run_id)
     store.cancel_remaining_tasks(run_id, "Cancelled: worker crashed")
     logger.info("Run %s crashed due to task %s: %s", run_id, task_id, error_message)
+
+
+def abort_run(
+    store: DagStore,
+    *,
+    run_id: str,
+    reason: str,
+    callbacks: OrchestratorCallbacks,
+    status: RunStatus = RunStatus.FAILED,
+) -> bool:
+    """Terminate a run externally (deadline, cancellation, admin kill).
+
+    Run-level counterpart to on_task_failed / on_task_crashed. Use when
+    no single task triggered the termination. For task-level timeouts,
+    use on_task_failed instead.
+    """
+    if status not in (RunStatus.FAILED, RunStatus.CRASHED, RunStatus.CANCELLED):
+        raise ValueError(
+            f"abort_run status must be FAILED, CRASHED, or CANCELLED, got {status}"
+        )
+
+    if not store.try_claim_run_terminal(run_id, status, reason):
+        logger.info("Run %s already terminal, skipping abort", run_id)
+        return False
+
+    match status:
+        case RunStatus.CRASHED:
+            callbacks.on_run_crashed(run_id)
+        case RunStatus.CANCELLED:
+            callbacks.on_run_cancelled(run_id)
+        case _:
+            callbacks.on_run_failed(run_id)
+
+    _evict_topology(run_id)
+    store.cancel_remaining_tasks(run_id, f"Cancelled: {reason}")
+    logger.info("Run %s aborted (%s): %s", run_id, status.value, reason)
+    return True

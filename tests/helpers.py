@@ -256,12 +256,6 @@ class MockDagStore:
         self.failed_nodes.append(FailedRecord(run_id, node_index, plugin_name, error))
         return task_id
 
-    def fail_run(self, run_id: str, error: str) -> bool:
-        claimed = self.try_claim_run_terminal(run_id, RunStatus.FAILED, error)
-        if claimed:
-            self.cancel_remaining_tasks(run_id, error)
-        return claimed
-
     def mark_task_failed(self, task_id: str, error: str) -> str | None:
         record = self._tasks.get(task_id)
         if record is None:

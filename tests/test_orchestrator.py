@@ -4,6 +4,7 @@ from dagabaaz.constants import FanMode, RunStatus, TaskStatus
 from dagabaaz.models import EdgeFilter, FilterRule
 from dagabaaz.orchestrator import (
     OrchestratorCallbacks,
+    abort_run,
     on_task_complete,
     on_task_crashed,
     on_task_failed,
@@ -15,11 +16,17 @@ pytestmark = pytest.mark.usefixtures("reset_topology_cache")
 
 
 def _make_callbacks() -> tuple[OrchestratorCallbacks, dict[str, list[str]]]:
-    tracker: dict[str, list[str]] = {"completed": [], "failed": [], "crashed": []}
+    tracker: dict[str, list[str]] = {
+        "completed": [],
+        "failed": [],
+        "crashed": [],
+        "cancelled": [],
+    }
     callbacks = OrchestratorCallbacks(
         on_run_completed=lambda rid: tracker["completed"].append(rid),
         on_run_failed=lambda rid: tracker["failed"].append(rid),
         on_run_crashed=lambda rid: tracker["crashed"].append(rid),
+        on_run_cancelled=lambda rid: tracker["cancelled"].append(rid),
     )
     return callbacks, tracker
 
@@ -480,3 +487,113 @@ def test_already_terminal_no_op(
     )
 
     assert tracker[tracker_key] == []
+
+
+class TestAbortRun:
+    def test_failed_fires_failed_callback(self) -> None:
+        nodes = [
+            make_node("fetch", slug="a"),
+            make_node("process", slug="b", depends_on=["a"]),
+        ]
+        store = MockDagStore()
+        store.setup_run("run-1", nodes)
+        store.setup_task("task-a", "run-1", 0, "fetch", TaskStatus.RUNNING)
+        callbacks, tracker = _make_callbacks()
+
+        result = abort_run(
+            store,
+            run_id="run-1",
+            reason="run deadline exceeded",
+            callbacks=callbacks,
+        )
+
+        assert result is True
+        assert store._run_status["run-1"] == RunStatus.FAILED
+        assert tracker["failed"] == ["run-1"]
+        assert len(store.cancelled_runs) == 1
+
+    def test_crashed_fires_crashed_callback(self) -> None:
+        nodes = [make_node("fetch", slug="a")]
+        store = MockDagStore()
+        store.setup_run("run-1", nodes)
+        store.setup_task("task-a", "run-1", 0, "fetch", TaskStatus.RUNNING)
+        callbacks, tracker = _make_callbacks()
+
+        result = abort_run(
+            store,
+            run_id="run-1",
+            reason="infra failure",
+            callbacks=callbacks,
+            status=RunStatus.CRASHED,
+        )
+
+        assert result is True
+        assert store._run_status["run-1"] == RunStatus.CRASHED
+        assert tracker["crashed"] == ["run-1"]
+        assert len(store.cancelled_runs) == 1
+
+    def test_cancelled_fires_cancelled_callback(self) -> None:
+        nodes = [make_node("fetch", slug="a")]
+        store = MockDagStore()
+        store.setup_run("run-1", nodes)
+        store.setup_task("task-a", "run-1", 0, "fetch", TaskStatus.RUNNING)
+        callbacks, tracker = _make_callbacks()
+
+        result = abort_run(
+            store,
+            run_id="run-1",
+            reason="Cancelled by user",
+            callbacks=callbacks,
+            status=RunStatus.CANCELLED,
+        )
+
+        assert result is True
+        assert store._run_status["run-1"] == RunStatus.CANCELLED
+        assert tracker["cancelled"] == ["run-1"]
+        assert len(store.cancelled_runs) == 1
+
+    def test_already_terminal_returns_false(self) -> None:
+        nodes = [make_node("fetch", slug="a")]
+        store = MockDagStore()
+        store.setup_run("run-1", nodes, status=RunStatus.FAILED)
+        store._terminal_claimed.add("run-1")
+        callbacks, tracker = _make_callbacks()
+
+        result = abort_run(
+            store,
+            run_id="run-1",
+            reason="too late",
+            callbacks=callbacks,
+        )
+
+        assert result is False
+        assert tracker["failed"] == []
+
+    def test_rejects_invalid_status(self) -> None:
+        store = MockDagStore()
+        callbacks, _ = _make_callbacks()
+
+        with pytest.raises(ValueError, match="FAILED, CRASHED, or CANCELLED"):
+            abort_run(
+                store,
+                run_id="run-1",
+                reason="nope",
+                callbacks=callbacks,
+                status=RunStatus.COMPLETED,
+            )
+
+    def test_evicts_topology_cache(self) -> None:
+        nodes = [make_node("fetch", slug="a")]
+        store = MockDagStore()
+        store.setup_run("run-1", nodes)
+        store.setup_task("task-a", "run-1", 0, "fetch", TaskStatus.RUNNING)
+
+        from dagabaaz.topology import _topology_cache, get_or_build
+
+        get_or_build("run-1", lambda: nodes, lambda _: False)
+        assert "run-1" in _topology_cache
+
+        callbacks, _ = _make_callbacks()
+        abort_run(store, run_id="run-1", reason="timeout", callbacks=callbacks)
+
+        assert "run-1" not in _topology_cache
