@@ -9,6 +9,21 @@ description = "A DAG execution engine for pipeline orchestration."
 license = "MIT"
 license-files = ["LICENSE"]
 readme = "README.md"
+authors = [
+    { name = "Varun Chopra" },
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Topic :: Software Development :: Libraries :: Application Frameworks",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Typing :: Typed",
+]
 
 [project.optional-dependencies]
 re2 = [
@@ -18,6 +33,10 @@ dev = [
     "pytest>=8.0",
     "ruff",
 ]
+
+[project.urls]
+Repository = "https://github.com/varunchopra/dagabaaz"
+Issues = "https://github.com/varunchopra/dagabaaz/issues"
 
 [build-system]
 requires = ["uv_build>=0.11.3,<0.12"]
