@@ -23,22 +23,21 @@ from dagabaaz.models import (
 logger = logging.getLogger(__name__)
 
 
-def extract_artifact_field(artifacts: list[DagArtifactLike], key: str) -> list[str]:
-    """Extract a field from a list of artifacts by attribute name or metadata key.
+def extract_artifact_field(artifacts: list[DagArtifactLike], key: str) -> list[object]:
+    """Extract a field from artifact attributes or metadata, preserving native types.
 
-    Standard fields (file_path, file_name, file_size, mime_type) are read
-    via getattr. Everything else is looked up in the artifact's metadata dict.
-    Works with any object that has the right attributes — DagArtifact,
-    ArtifactWorkerRow, or any duck-typed equivalent.
+    The pipe layer handles type-specific behavior (string pipes coerce
+    on entry via ``str()``; structured pipes ``isinstance``-check), so
+    pre-coercing here would silently break ``json_get`` and friends.
     """
-    values: list[str] = []
+    values: list[object] = []
     for artifact in artifacts:
         if key in ARTIFACT_STANDARD_FIELDS:
             field_value = getattr(artifact, key)
             if field_value is not None:
-                values.append(str(field_value))
+                values.append(field_value)
         elif key in artifact.metadata:
-            values.append(str(artifact.metadata[key]))
+            values.append(artifact.metadata[key])
         else:
             # Surface binding typos (e.g. "file_paht") — silent drops
             # produce empty results with zero diagnostic signal.
@@ -50,7 +49,9 @@ def extract_artifact_field(artifacts: list[DagArtifactLike], key: str) -> list[s
     return values
 
 
-def _unwrap_field(artifacts: list[DagArtifactLike], key: str) -> str | list[str] | None:
+def _unwrap_field(
+    artifacts: list[DagArtifactLike], key: str
+) -> object | list[object] | None:
     """Extract a field from artifacts, returning scalar for single values.
 
     Shared by resolve_binding (NodeSource) and build_expression_lookup

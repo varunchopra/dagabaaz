@@ -199,9 +199,10 @@ Input bindings can use `{namespace.key | pipe}` expressions:
 "{list(branch_a.url, branch_b.url) | join(,)}"  # multiple sources
 "{input.api_url | required}"  # run input
 "{config.output_format | default(mp4)}"  # config value
+"{source.shareable_urls | json_get(embed_urls)}"  # navigate dict metadata
 ```
 
-Built-in pipes include `upper`, `lower`, `default`, `required`, `join`, `basename`, `match`, and others. See [`pipes.py`](src/dagabaaz/pipes.py) for the full list.
+Built-in pipes include `upper`, `lower`, `default`, `required`, `join`, `basename`, `match`, `json_get`, and others. See [`pipes.py`](src/dagabaaz/pipes.py) for the full list.
 
 Expressions are validated at pipeline save time and evaluated at task execution time.
 
