@@ -177,6 +177,33 @@ nodes = [
 
 When `source` produces a mix of `.mp4` and `.srt` files, the engine routes each type to the correct branch. If a branch receives no artifacts (e.g., no subtitles), it is marked `filtered` and does not block downstream nodes.
 
+### Conditional bindings with `when`
+
+A `when` clause gates a binding on an expression; the field is populated only when `when` evaluates truthy.
+
+```python
+from dagabaaz.models import DagNode, NodeSource
+
+nodes = [
+    DagNode(slug="lookup", plugin="library_lookup"),
+    DagNode(
+        slug="create",
+        plugin="create_record",
+        depends_on=["lookup"],
+        bindings={
+            "title": NodeSource(node="lookup", key="title"),
+            "thumbnail_url": NodeSource(
+                node="lookup",
+                key="thumbnail_url",
+                when="{lookup.existing_id | not}",
+            ),
+        },
+    ),
+]
+```
+
+The clause uses the same expression language as `ExpressionSource` bindings.
+
 ## Concepts
 
 A pipeline is a graph of **nodes**. Each node wraps a plugin and declares which other nodes it depends on. When you execute a pipeline, that execution is called a **run**.

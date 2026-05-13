@@ -1,6 +1,11 @@
 import pytest
 
-from dagabaaz.schema import InputFieldSpec, merge_run_input
+from dagabaaz.models import DagNode, NodeSource
+from dagabaaz.schema import (
+    InputFieldSpec,
+    merge_run_input,
+    validate_binding_references,
+)
 
 
 class TestMergeRunInput:
@@ -88,3 +93,35 @@ class TestMergeRunInput:
         fields = [InputFieldSpec(name="count", label="Count", required=True)]
         result = merge_run_input(fields, {}, {"count": "0"})
         assert result["count"] == "0"
+
+
+class TestValidateBindingWhenClause:
+    def _nodes_with_when(self, when_expr: str) -> tuple[list[DagNode], dict[str, int]]:
+        nodes = [
+            DagNode(plugin="src", slug="a"),
+            DagNode(
+                plugin="proc",
+                slug="b",
+                depends_on=["a"],
+                bindings={
+                    "field": NodeSource(node="a", key="x", when=when_expr),
+                },
+            ),
+        ]
+        return nodes, {"a": 0, "b": 1}
+
+    def test_bad_syntax_rejected(self) -> None:
+        nodes, idx = self._nodes_with_when("{unclosed")
+        err = validate_binding_references(nodes, idx)
+        assert err is not None
+        assert "when-clause error" in err
+
+    def test_unknown_slug_rejected(self) -> None:
+        nodes, idx = self._nodes_with_when("{ghost.flag}")
+        err = validate_binding_references(nodes, idx)
+        assert err is not None
+        assert "not in depends_on" in err
+
+    def test_valid_when_accepted(self) -> None:
+        nodes, idx = self._nodes_with_when("{a.flag | not}")
+        assert validate_binding_references(nodes, idx) is None

@@ -354,6 +354,49 @@ class TestPipes:
     def test_json_get_invalid_json(self) -> None:
         assert _PIPES["json_get"]("not json", "key") is None
 
+    @pytest.mark.parametrize(
+        "value,expected",
+        [
+            (None, True),
+            ("", True),
+            (False, True),
+            (0, True),
+            ([], True),
+            ({}, True),
+            ("hello", False),
+            (True, False),
+            ([0], False),
+        ],
+    )
+    def test_not(self, value: object, expected: bool) -> None:
+        assert _PIPES["not"](value) is expected
+
+    def test_eq(self) -> None:
+        assert _PIPES["eq"]("tv", "tv") is True
+        assert _PIPES["eq"]("tv", "movie") is False
+        assert _PIPES["eq"](42, "42") is True
+
+    def test_neq(self) -> None:
+        assert _PIPES["neq"]("tv", "movie") is True
+        assert _PIPES["neq"]("tv", "tv") is False
+
+    def test_gt(self) -> None:
+        assert _PIPES["gt"](0.9, "0.8") is True
+        assert _PIPES["gt"]("0.5", "0.8") is False
+        assert _PIPES["gt"](1, "1") is False
+
+    def test_gt_non_numeric_returns_false(self) -> None:
+        assert _PIPES["gt"]("abc", "0.8") is False
+        assert _PIPES["gt"](None, "0") is False
+
+    def test_lt(self) -> None:
+        assert _PIPES["lt"](0.3, "0.8") is True
+        assert _PIPES["lt"]("0.9", "0.8") is False
+
+    def test_in(self) -> None:
+        assert _PIPES["in"]("tv", "tv", "movie") is True
+        assert _PIPES["in"]("podcast", "tv", "movie") is False
+
 
 class TestRefEdgeCases:
     """Edge cases for namespace.key splitting, tested through the public API."""

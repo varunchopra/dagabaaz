@@ -23,6 +23,7 @@ class NodeSource(BaseModel):
     source: Literal["previous_node"] = "previous_node"
     node: str  # slug of the dependency node
     key: str = ""  # artifact field: file_path, url, or metadata key
+    when: str | None = None
 
 
 class ConfigSource(BaseModel):
@@ -30,6 +31,7 @@ class ConfigSource(BaseModel):
 
     source: Literal["config"] = "config"
     value: str = ""  # the literal value
+    when: str | None = None
 
 
 class RuntimeSource(BaseModel):
@@ -41,6 +43,7 @@ class RuntimeSource(BaseModel):
     placeholder: str = ""
     required: bool = False
     default: str = ""
+    when: str | None = None
 
 
 class ExpressionSource(BaseModel):
@@ -48,6 +51,7 @@ class ExpressionSource(BaseModel):
 
     source: Literal["expression"] = "expression"
     expression: str  # e.g. "{step_1.file_path | basename}"
+    when: str | None = None
 
 
 InputBinding = Annotated[

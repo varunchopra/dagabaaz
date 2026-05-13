@@ -136,7 +136,9 @@ def extract_node_indices_from_bindings(
     bindings: dict[str, InputBinding],
     slug_to_node_index: dict[str, int],
 ) -> set[int]:
-    """Collect all node indices needed by NodeSource/ExpressionSource bindings."""
+    """Collect all node indices needed by NodeSource/ExpressionSource bindings
+    and their `when` clauses.
+    """
     indices: set[int] = set()
     for binding in bindings.values():
         match binding:
@@ -150,13 +152,28 @@ def extract_node_indices_from_bindings(
                     idx = slug_to_node_index.get(slug)
                     if idx is not None:
                         indices.add(idx)
+
+        if binding.when:
+            # Asymmetric with the ExpressionSource branch by design:
+            # validate_binding_references is the save-time gate, so a bad
+            # `when` at runtime is logged-and-skipped rather than fatal.
+            try:
+                when_slugs, _ = extract_refs(binding.when)
+            except ExpressionError:
+                continue
+            for slug in when_slugs:
+                idx = slug_to_node_index.get(slug)
+                if idx is not None:
+                    indices.add(idx)
     return indices
 
 
 def any_binding_requires_run_input(
     bindings: dict[str, InputBinding],
 ) -> bool:
-    """Check if any binding needs run input (RuntimeSource or expression with input.*)."""
+    """Check if any binding needs run input (RuntimeSource, expression, or
+    `when` clause referencing input.*).
+    """
     for binding in bindings.values():
         match binding:
             case RuntimeSource():
@@ -171,4 +188,12 @@ def any_binding_requires_run_input(
                     continue
                 if runtime_keys:
                     return True
+
+        if binding.when:
+            try:
+                _, when_keys = extract_refs(binding.when)
+            except ExpressionError:
+                continue
+            if when_keys:
+                return True
     return False

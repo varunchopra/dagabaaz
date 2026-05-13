@@ -228,6 +228,40 @@ def _pad(value: object, width: str = "2") -> object:
         return str(value)
 
 
+def _not(value: object) -> object:
+    """Must stay in sync with `_is_truthy`."""
+    return not bool(value)
+
+
+def _eq(value: object, expected: str) -> object:
+    return str(value) == expected
+
+
+def _neq(value: object, expected: str) -> object:
+    return str(value) != expected
+
+
+def _gt(value: object, threshold: str) -> object:
+    """Returns False on non-numeric input."""
+    try:
+        return float(value) > float(threshold)
+    except (ValueError, TypeError):
+        return False
+
+
+def _lt(value: object, threshold: str) -> object:
+    """Returns False on non-numeric input."""
+    try:
+        return float(value) < float(threshold)
+    except (ValueError, TypeError):
+        return False
+
+
+def _in(value: object, *options: str) -> object:
+    """`{x | in(tv, movie, podcast)}`."""
+    return str(value) in options
+
+
 BUILTIN_PIPES: Final[types.MappingProxyType[str, Callable[..., object]]] = (
     types.MappingProxyType(
         {
@@ -261,6 +295,12 @@ BUILTIN_PIPES: Final[types.MappingProxyType[str, Callable[..., object]]] = (
             "flatten": _flatten,
             "compact": _compact,
             "pad": _pad,
+            "not": _not,
+            "eq": _eq,
+            "neq": _neq,
+            "gt": _gt,
+            "lt": _lt,
+            "in": _in,
         }
     )
 )
@@ -298,4 +338,10 @@ PIPE_ARITY: Final[dict[str, tuple[int, int]]] = {
     "flatten": (0, 0),
     "compact": (0, 0),
     "pad": (0, 1),
+    "not": (0, 0),
+    "eq": (1, 1),
+    "neq": (1, 1),
+    "gt": (1, 1),
+    "lt": (1, 1),
+    "in": (1, 32),
 }

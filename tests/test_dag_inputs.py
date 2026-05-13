@@ -1,6 +1,12 @@
-from dagabaaz.models import TaskArtifact
+import pytest
+
+from dagabaaz.models import ConfigSource, DagNode, NodeSource, TaskArtifact
 from dagabaaz.store import TaskInputStore
-from dagabaaz.task_input import build_task_input, collect_upstream_task_artifacts_bfs
+from dagabaaz.task_input import (
+    build_task_input,
+    collect_upstream_task_artifacts_bfs,
+    resolve_task_bindings,
+)
 from tests.helpers import make_node as _node
 
 
@@ -303,3 +309,173 @@ class TestCollectUpstreamBfsPassthrough:
 
         assert len(result) == 1
         assert result[0].file_name == "root.dat"
+
+
+def _two_node_run(target_bindings: dict, upstream_metadata: dict | None = None):
+    """Build a two-node run (upstream → target) with the given target bindings.
+
+    Returns (store, nodes) ready for resolve_task_bindings(node_index=1).
+    """
+    upstream_art = _art(metadata=upstream_metadata or {})
+    store = MockTaskInputStore(
+        artifacts_by_node={"run-1": {0: [upstream_art]}},
+    )
+    nodes = [
+        _node("source", slug="upstream"),
+        DagNode(
+            plugin="target",
+            slug="target",
+            depends_on=["upstream"],
+            bindings=target_bindings,
+        ),
+    ]
+    return store, nodes
+
+
+class TestResolveTaskBindingsWhenClause:
+    def test_truthy_when_fires_binding(self) -> None:
+        store, nodes = _two_node_run(
+            target_bindings={
+                "field": NodeSource(
+                    node="upstream", key="payload", when="{upstream.flag}"
+                )
+            },
+            upstream_metadata={"flag": "yes", "payload": "v"},
+        )
+        input_data: dict[str, object] = {}
+        resolve_task_bindings(
+            store, run_id="run-1", node_index=1, nodes=nodes, input_data=input_data
+        )
+        assert input_data == {"field": "v"}
+
+    def test_falsy_when_skips_binding(self) -> None:
+        store, nodes = _two_node_run(
+            target_bindings={
+                "field": NodeSource(
+                    node="upstream", key="payload", when="{upstream.flag}"
+                )
+            },
+            upstream_metadata={"flag": "", "payload": "v"},
+        )
+        input_data: dict[str, object] = {}
+        resolve_task_bindings(
+            store, run_id="run-1", node_index=1, nodes=nodes, input_data=input_data
+        )
+        assert "field" not in input_data
+
+    def test_not_pipe_fires_when_absent(self) -> None:
+        """Canonical idiom: `when="{path | not}"` fires when path is missing."""
+        store, nodes = _two_node_run(
+            target_bindings={
+                "field": NodeSource(
+                    node="upstream",
+                    key="payload",
+                    when="{upstream.maybe_id | not}",
+                )
+            },
+            upstream_metadata={"payload": "v"},
+        )
+        input_data: dict[str, object] = {}
+        resolve_task_bindings(
+            store, run_id="run-1", node_index=1, nodes=nodes, input_data=input_data
+        )
+        assert input_data == {"field": "v"}
+
+    def test_malformed_when_skips_binding(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Bad syntax at runtime logs + skips; validation is the save-time gate."""
+        store, nodes = _two_node_run(
+            target_bindings={
+                "field": NodeSource(
+                    node="upstream", key="payload", when="{unclosed"
+                )
+            },
+            upstream_metadata={"payload": "v"},
+        )
+        input_data: dict[str, object] = {}
+        with caplog.at_level("WARNING"):
+            resolve_task_bindings(
+                store,
+                run_id="run-1",
+                node_index=1,
+                nodes=nodes,
+                input_data=input_data,
+            )
+        assert "field" not in input_data
+        assert any("when-clause" in rec.message for rec in caplog.records)
+
+    def test_falsy_when_preserves_artifact_spread(self) -> None:
+        """A skipped binding must not overwrite a value already in input_data."""
+        store, nodes = _two_node_run(
+            target_bindings={
+                "x": NodeSource(
+                    node="upstream", key="payload", when="{upstream.flag}"
+                )
+            },
+            upstream_metadata={"flag": "", "payload": "from_binding"},
+        )
+        input_data: dict[str, object] = {"x": "from_artifact"}
+        resolve_task_bindings(
+            store, run_id="run-1", node_index=1, nodes=nodes, input_data=input_data
+        )
+        assert input_data == {"x": "from_artifact"}
+
+    def test_truthy_when_overwrites_artifact_spread(self) -> None:
+        """A firing binding overrides – this is today's unconditional behaviour."""
+        store, nodes = _two_node_run(
+            target_bindings={
+                "x": NodeSource(
+                    node="upstream", key="payload", when="{upstream.flag}"
+                )
+            },
+            upstream_metadata={"flag": "yes", "payload": "from_binding"},
+        )
+        input_data: dict[str, object] = {"x": "from_artifact"}
+        resolve_task_bindings(
+            store, run_id="run-1", node_index=1, nodes=nodes, input_data=input_data
+        )
+        assert input_data == {"x": "from_binding"}
+
+    def test_when_only_node_ref_still_loads_artifacts(self) -> None:
+        """A `when` that references upstream must trigger artifact loading
+        even when no other binding does.
+        """
+        store, nodes = _two_node_run(
+            target_bindings={
+                "field": ConfigSource(value="literal", when="{upstream.flag}")
+            },
+            upstream_metadata={"flag": "yes"},
+        )
+        input_data: dict[str, object] = {}
+        resolve_task_bindings(
+            store, run_id="run-1", node_index=1, nodes=nodes, input_data=input_data
+        )
+        assert input_data == {"field": "literal"}
+
+    def test_when_input_ref_loads_run_input(self) -> None:
+        """A `when` that references {input.*} must trigger run_input loading
+        even when no RuntimeSource binding does.
+        """
+        store = MockTaskInputStore(
+            artifacts_by_node={"run-1": {0: [_art()]}},
+            run_inputs={"run-1": {"feature_on": True}},
+        )
+        nodes = [
+            _node("source", slug="upstream"),
+            DagNode(
+                plugin="target",
+                slug="target",
+                depends_on=["upstream"],
+                bindings={
+                    "field": ConfigSource(
+                        value="literal", when="{input.feature_on}"
+                    )
+                },
+            ),
+        ]
+        input_data: dict[str, object] = {}
+        resolve_task_bindings(
+            store, run_id="run-1", node_index=1, nodes=nodes, input_data=input_data
+        )
+        assert input_data == {"field": "literal"}

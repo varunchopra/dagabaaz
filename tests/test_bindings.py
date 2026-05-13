@@ -37,3 +37,10 @@ def test_multiple_artifacts_resolve_to_list() -> None:
     a1 = make_dag_artifact("a", metadata={"x": {"k": 1}})
     a2 = make_dag_artifact("b", metadata={"x": {"k": 2}})
     assert _resolve(NodeSource(node="upstream", key="x"), a1, a2) == [{"k": 1}, {"k": 2}]
+
+
+def test_resolve_binding_ignores_when_clause() -> None:
+    """`when` is evaluated by task_input.resolve_task_bindings, not here."""
+    art = make_dag_artifact("x", metadata={"payload": "v"})
+    binding = NodeSource(node="upstream", key="payload", when="{anything | not}")
+    assert _resolve(binding, art) == "v"

@@ -8,9 +8,11 @@ from typing import Any
 
 from dagabaaz.bindings import (
     any_binding_requires_run_input,
+    build_expression_lookup,
     extract_node_indices_from_bindings,
     resolve_binding,
 )
+from dagabaaz.expressions import resolve_expression
 from dagabaaz.filter import filter_artifacts, filter_artifacts_by_origin
 from dagabaaz.graph import (
     bfs_collect,
@@ -18,10 +20,20 @@ from dagabaaz.graph import (
     rekey_edge_filters_by_index,
     resolve_dependency_indices,
 )
-from dagabaaz.models import DagNode, EdgeFilter, TaskArtifact
+from dagabaaz.models import DagNode, EdgeFilter, ExpressionError, TaskArtifact
 from dagabaaz.store import TaskInputStore
 
 logger = logging.getLogger(__name__)
+
+
+def _is_truthy(value: object) -> bool:
+    """Plain bool() – False/0/[]/{} are falsy.
+
+    Stricter than the `default` pipe and EXISTS/NOT_EXISTS filter operators
+    (which only treat None/"" as absent). Must stay in sync with the `not`
+    pipe.
+    """
+    return bool(value)
 
 
 def collect_upstream_task_artifacts_bfs(
@@ -258,7 +270,26 @@ def resolve_task_bindings(
         store.get_run_input(run_id) if any_binding_requires_run_input(bindings) else {}
     )
 
+    lookup = build_expression_lookup(
+        artifacts_by_node, slug_to_index, run_input, node_config or {}
+    )
+
+    # Composition is the pipe chain – no infix and/or in the language.
     for field, binding in bindings.items():
+        if binding.when is not None:
+            try:
+                when_value = resolve_expression(binding.when, lookup)
+            except ExpressionError as exc:
+                logger.warning(
+                    "when-clause expression error on node %d field %r: %s",
+                    node_index,
+                    field,
+                    exc,
+                )
+                continue
+            if not _is_truthy(when_value):
+                continue
+
         value = resolve_binding(
             binding,
             artifacts_by_node,

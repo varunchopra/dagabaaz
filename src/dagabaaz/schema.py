@@ -178,4 +178,18 @@ def validate_binding_references(
                     if slug not in dep_set:
                         return f"{label}: expression references '{slug}' which is not in depends_on"
 
+            if binding.when:
+                when_err = validate_expression(binding.when)
+                if when_err:
+                    return (
+                        f"{label}: binding '{field_name}' when-clause error: {when_err}"
+                    )
+                when_slugs, _ = extract_refs(binding.when)
+                for slug in when_slugs:
+                    if slug not in dep_set:
+                        return (
+                            f"{label}: when-clause on binding '{field_name}' "
+                            f"references '{slug}' which is not in depends_on"
+                        )
+
     return None
