@@ -412,6 +412,85 @@ def test_subtitle_extension_recognized(ext: str) -> None:
     assert len(result) == 1
 
 
+@pytest.mark.parametrize(
+    "metadata_value,rule_value,expected_match",
+    [
+        # Direct bool ↔ lowercase-str match
+        (False, "false", True),
+        (True, "true", True),
+        (False, "true", False),
+        (True, "false", False),
+        # Case-insensitive + whitespace tolerance
+        (False, "False", True),
+        (True, "TRUE", True),
+        (False, " false ", True),
+        # Intentional change: no bool ↔ "0"/"1" match
+        (False, "0", False),
+        (True, "1", False),
+    ],
+)
+def test_eq_bool_metadata(
+    metadata_value: bool, rule_value: str, expected_match: bool
+) -> None:
+    arts = [_art("a.mp4", 100, None, {"was_created": metadata_value})]
+    ef = EdgeFilter(
+        rules=[FilterRule(field="was_created", operator="eq", value=rule_value)]
+    )
+    assert (len(filter_artifacts(arts, ef)) == 1) == expected_match
+
+
+@pytest.mark.parametrize(
+    "metadata_value,rule_value,expected_match",
+    [
+        (False, "false", False),
+        (True, "false", True),
+        (False, "true", True),
+        (False, "False", False),
+    ],
+)
+def test_neq_bool_metadata(
+    metadata_value: bool, rule_value: str, expected_match: bool
+) -> None:
+    arts = [_art("a.mp4", 100, None, {"was_created": metadata_value})]
+    ef = EdgeFilter(
+        rules=[FilterRule(field="was_created", operator="neq", value=rule_value)]
+    )
+    assert (len(filter_artifacts(arts, ef)) == 1) == expected_match
+
+
+def test_in_bool_metadata() -> None:
+    arts = [
+        _art("a.mp4", 100, None, {"flag": False}),
+        _art("b.mp4", 100, None, {"flag": True}),
+    ]
+    ef = EdgeFilter(rules=[FilterRule(field="flag", operator="in", value=["false"])])
+    result = filter_artifacts(arts, ef)
+    assert len(result) == 1
+    assert result[0].file_name == "a.mp4"
+
+
+def test_not_in_bool_metadata_case_insensitive() -> None:
+    arts = [_art("a.mp4", 100, None, {"flag": True})]
+    ef = EdgeFilter(
+        rules=[FilterRule(field="flag", operator="not_in", value=["FALSE"])]
+    )
+    assert len(filter_artifacts(arts, ef)) == 1
+
+
+def test_gt_numeric_path_unchanged() -> None:
+    """GT on non-bool numeric values."""
+    arts = [_art("a.mp4", 1000)]
+    ef = EdgeFilter(rules=[FilterRule(field="file_size", operator="gt", value=999)])
+    assert len(filter_artifacts(arts, ef)) == 1
+
+
+def test_gt_on_bool_returns_false() -> None:
+    """GT/GTE/LT/LTE on bool fields return False."""
+    arts = [_art("a.mp4", 100, None, {"flag": True})]
+    ef = EdgeFilter(rules=[FilterRule(field="flag", operator="gt", value=0)])
+    assert filter_artifacts(arts, ef) == []
+
+
 class TestGroupByOrigin:
     """Direct tests for group_by_origin broadcast and grouping semantics."""
 

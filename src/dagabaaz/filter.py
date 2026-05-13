@@ -170,14 +170,25 @@ def _resolve_field(artifact: DagArtifactLike, field: str) -> Any:
     return artifact.metadata.get(field)
 
 
-def _coerce_numeric(value: Any) -> float | None:
-    """Try to coerce a value to float for numeric comparisons.
+_BOOL_LITERALS = {"true": True, "false": False}
 
-    Returns None if the value can't be meaningfully compared numerically.
-    This handles the common case where metadata values are strings
-    (from JSON deserialization) but the rule wants numeric comparison.
+
+def _coerce_bool_literal(value: Any) -> bool | None:
+    """True/False or "true"/"false" (case-insensitive, whitespace-stripped);
+    None otherwise so the caller falls through to the next path.
     """
-    if value is None:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return _BOOL_LITERALS.get(value.strip().lower())
+    return None
+
+
+def _coerce_numeric(value: Any) -> float | None:
+    """Coerce to float for numeric comparisons; None if not meaningful.
+    Bool is explicitly excluded – see _coerce_bool_literal.
+    """
+    if value is None or isinstance(value, bool):
         return None
     try:
         return float(value)
@@ -185,21 +196,28 @@ def _coerce_numeric(value: Any) -> float | None:
         return None
 
 
-# Each function evaluates one FilterOperator against actual/expected values.
-def _eval_eq(actual: Any, expected: Any) -> bool:
+def _values_equal(actual: Any, expected: Any) -> bool:
+    """Shared equality for EQ/NEQ/IN/NOT_IN."""
+    a_bool = _coerce_bool_literal(actual)
+    e_bool = _coerce_bool_literal(expected)
+    if a_bool is not None and e_bool is not None:
+        return a_bool == e_bool
+
     actual_num = _coerce_numeric(actual)
     expected_num = _coerce_numeric(expected)
     if actual_num is not None and expected_num is not None:
         return actual_num == expected_num
+
     return str(actual) == str(expected)
 
 
+# Each function evaluates one FilterOperator against actual/expected values.
+def _eval_eq(actual: Any, expected: Any) -> bool:
+    return _values_equal(actual, expected)
+
+
 def _eval_neq(actual: Any, expected: Any) -> bool:
-    actual_num = _coerce_numeric(actual)
-    expected_num = _coerce_numeric(expected)
-    if actual_num is not None and expected_num is not None:
-        return actual_num != expected_num
-    return str(actual) != str(expected)
+    return not _values_equal(actual, expected)
 
 
 def _eval_gt(actual: Any, expected: Any) -> bool:
@@ -235,21 +253,15 @@ def _eval_lte(actual: Any, expected: Any) -> bool:
 
 
 def _eval_in(actual: Any, expected: Any) -> bool:
-    # Only reached as fallback when the caller's precomputed frozenset is
-    # None — i.e., a single membership test. Linear scan is cheaper than
-    # constructing a frozenset for a one-shot check.
     if isinstance(expected, list):
-        s = str(actual)
-        return any(s == str(v) for v in expected)
-    return str(actual) == str(expected)
+        return any(_values_equal(actual, v) for v in expected)
+    return _values_equal(actual, expected)
 
 
 def _eval_not_in(actual: Any, expected: Any) -> bool:
-    # Mirror of _eval_in — linear scan for single-use fallback path.
     if isinstance(expected, list):
-        s = str(actual)
-        return not any(s == str(v) for v in expected)
-    return str(actual) != str(expected)
+        return not any(_values_equal(actual, v) for v in expected)
+    return not _values_equal(actual, expected)
 
 
 def _eval_contains(actual: Any, expected: Any) -> bool:
@@ -299,37 +311,15 @@ _OPERATOR_DISPATCH: dict[FilterOperator, Callable[[Any, Any], bool]] = {
 }
 
 
-def _artifact_satisfies_rule(
-    artifact: DagArtifactLike,
-    rule: FilterRule,
-    *,
-    precomputed: frozenset[str] | None = None,
-) -> bool:
-    """Evaluate a single FilterRule against an artifact.
-
-    Returns True if the artifact passes (satisfies) the rule.
-
-    ``precomputed`` is an optional pre-built frozenset for IN/NOT_IN rules,
-    avoiding O(n) set construction per (artifact, rule) pair when the caller
-    has already stringified the expected values once.
-    """
+def _artifact_satisfies_rule(artifact: DagArtifactLike, rule: FilterRule) -> bool:
     actual = _resolve_field(artifact, rule.field)
-    expected = rule.value
-
-    # Fast path for IN/NOT_IN when the caller pre-computed the membership set
-    if precomputed is not None:
-        if rule.operator == FilterOperator.IN:
-            return str(actual) in precomputed
-        if rule.operator == FilterOperator.NOT_IN:
-            return str(actual) not in precomputed
-
     evaluator = _OPERATOR_DISPATCH.get(rule.operator)
     if evaluator is None:
         logger.warning(
             "Unknown filter operator %r on field %r", rule.operator, rule.field
         )
         return False
-    return evaluator(actual, expected)
+    return evaluator(actual, rule.value)
 
 
 def filter_artifacts[A: DagArtifactLike](
@@ -355,22 +345,10 @@ def filter_artifacts[A: DagArtifactLike](
         # aliasing the caller's input list.
         return list(artifacts)
 
-    # Pre-compute frozensets for IN/NOT_IN membership rules — O(n) once
-    # per rule, not O(n) per (artifact x rule) evaluation.
-    precomputed: dict[int, frozenset[str]] = {}
-    for i, rule in enumerate(edge_filter.rules):
-        if rule.operator in (FilterOperator.IN, FilterOperator.NOT_IN) and isinstance(
-            rule.value, list
-        ):
-            precomputed[i] = frozenset(str(v) for v in rule.value)
-
     result = [
         artifact
         for artifact in artifacts
-        if all(
-            _artifact_satisfies_rule(artifact, rule, precomputed=precomputed.get(i))
-            for i, rule in enumerate(edge_filter.rules)
-        )
+        if all(_artifact_satisfies_rule(artifact, rule) for rule in edge_filter.rules)
     ]
 
     if edge_filter.select and result:
