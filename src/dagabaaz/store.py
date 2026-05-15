@@ -57,7 +57,22 @@ class DagStore(Protocol):
         ...
 
     def set_run_progress(self, run_id: str, completed_count: int) -> None:
-        """Update the run's progress to the count of completed nodes."""
+        """Update the run's progress to the count of completed nodes.
+
+        Called in two patterns. Running-state calls happen at the end of
+        reconcile ticks that advanced completion; the value is advisory
+        and may lag reality by one tick. Terminal-state calls happen
+        immediately before ``try_claim_run_terminal`` on every terminal
+        transition; consumers reading progress from inside any terminal
+        callback see the value written by that call.
+
+        Implementations that recompute progress on read may pass – the
+        advisory writes become noise and the terminal write becomes
+        redundant. Implementations that need atomic terminal+progress
+        can share a transaction with ``try_claim_run_terminal``; the
+        orchestrator's call ordering supports this but does not require
+        it.
+        """
         ...
 
     def get_task_context(self, task_id: str) -> TaskContext | None:

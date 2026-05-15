@@ -653,3 +653,241 @@ class TestAbortRun:
         abort_run(store, run_id="run-1", reason="timeout", callbacks=callbacks)
 
         assert "run-1" not in _topology_cache
+
+
+class _FailingProgressStore(MockDagStore):
+    """MockDagStore where the first set_run_progress call raises."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._fail_next = True
+
+    def set_run_progress(self, run_id: str, completed_count: int) -> None:
+        if self._fail_next:
+            self._fail_next = False
+            raise RuntimeError("simulated DB failure")
+        super().set_run_progress(run_id, completed_count)
+
+
+class TestProgressContract:
+    """Progress is current at every terminal callback, and progress-write
+    failure leaves the run recoverable rather than permanently terminal."""
+
+    def test_completion_callback_sees_final_progress(self) -> None:
+        nodes = [
+            make_node("fetch", slug="a"),
+            make_node("process", slug="b", depends_on=["a"]),
+        ]
+        store = MockDagStore()
+        store.setup_run("run-1", nodes)
+        store.setup_task("task-a", "run-1", 0, "fetch", TaskStatus.COMPLETED)
+        store.setup_task("task-b", "run-1", 1, "process", TaskStatus.COMPLETED)
+        captured: list[int | None] = []
+        callbacks = OrchestratorCallbacks(
+            on_run_completed=lambda rid: captured.append(
+                store._run_progress.get(rid)
+            ),
+            on_run_failed=lambda _: None,
+            on_run_crashed=lambda _: None,
+            on_run_cancelled=lambda _: None,
+        )
+
+        on_task_complete(
+            store,
+            task_id="task-b",
+            callbacks=callbacks,
+            resolve_passthrough=_no_passthrough,
+        )
+
+        assert captured == [2]
+
+    def test_in_loop_failure_callback_sees_current_progress(self) -> None:
+        nodes = [
+            make_node("source", slug="a"),
+            make_node("process", slug="b", depends_on=["a"]),
+        ]
+        store = MockDagStore()
+        store.setup_run("run-1", nodes)
+        store.setup_task("task-a", "run-1", 0, "source", TaskStatus.COMPLETED)
+        arts = [make_dag_artifact(f"file_{i}.dat") for i in range(201)]
+        store.setup_artifacts("run-1", 0, arts)
+        captured: list[int | None] = []
+        callbacks = OrchestratorCallbacks(
+            on_run_completed=lambda _: None,
+            on_run_failed=lambda rid: captured.append(
+                store._run_progress.get(rid)
+            ),
+            on_run_crashed=lambda _: None,
+            on_run_cancelled=lambda _: None,
+        )
+
+        on_task_complete(
+            store,
+            task_id="task-a",
+            callbacks=callbacks,
+            resolve_passthrough=_no_passthrough,
+        )
+
+        assert captured == [1]
+
+    def test_on_task_failed_callback_sees_current_progress(self) -> None:
+        nodes = [
+            make_node("fetch", slug="a"),
+            make_node("process", slug="b", depends_on=["a"]),
+        ]
+        store = MockDagStore()
+        store.setup_run("run-1", nodes)
+        store.setup_task("task-a", "run-1", 0, "fetch", TaskStatus.COMPLETED)
+        store.setup_task("task-b", "run-1", 1, "process", TaskStatus.RUNNING)
+        captured: list[int | None] = []
+        callbacks = OrchestratorCallbacks(
+            on_run_completed=lambda _: None,
+            on_run_failed=lambda rid: captured.append(
+                store._run_progress.get(rid)
+            ),
+            on_run_crashed=lambda _: None,
+            on_run_cancelled=lambda _: None,
+        )
+
+        on_task_failed(
+            store,
+            task_id="task-b",
+            error_message="plugin crashed",
+            callbacks=callbacks,
+        )
+
+        assert captured == [2]
+
+    def test_on_task_crashed_callback_sees_current_progress(self) -> None:
+        nodes = [
+            make_node("fetch", slug="a"),
+            make_node("process", slug="b", depends_on=["a"]),
+        ]
+        store = MockDagStore()
+        store.setup_run("run-1", nodes)
+        store.setup_task("task-a", "run-1", 0, "fetch", TaskStatus.COMPLETED)
+        store.setup_task("task-b", "run-1", 1, "process", TaskStatus.RUNNING)
+        captured: list[int | None] = []
+        callbacks = OrchestratorCallbacks(
+            on_run_completed=lambda _: None,
+            on_run_failed=lambda _: None,
+            on_run_crashed=lambda rid: captured.append(
+                store._run_progress.get(rid)
+            ),
+            on_run_cancelled=lambda _: None,
+        )
+
+        on_task_crashed(
+            store,
+            task_id="task-b",
+            error_message="OOM killed",
+            callbacks=callbacks,
+        )
+
+        assert captured == [2]
+
+    @pytest.mark.parametrize(
+        "abort_status,callback_field",
+        [
+            (RunStatus.FAILED, "on_run_failed"),
+            (RunStatus.CRASHED, "on_run_crashed"),
+            (RunStatus.CANCELLED, "on_run_cancelled"),
+        ],
+    )
+    def test_abort_callback_sees_current_progress(
+        self, abort_status: RunStatus, callback_field: str
+    ) -> None:
+        nodes = [
+            make_node("fetch", slug="a"),
+            make_node("process", slug="b", depends_on=["a"]),
+        ]
+        store = MockDagStore()
+        store.setup_run("run-1", nodes)
+        store.setup_task("task-a", "run-1", 0, "fetch", TaskStatus.COMPLETED)
+        store.setup_task("task-b", "run-1", 1, "process", TaskStatus.RUNNING)
+        captured: list[int | None] = []
+        capture = lambda rid: captured.append(store._run_progress.get(rid))  # noqa: E731
+        callback_kwargs = {
+            "on_run_completed": lambda _: None,
+            "on_run_failed": lambda _: None,
+            "on_run_crashed": lambda _: None,
+            "on_run_cancelled": lambda _: None,
+            callback_field: capture,
+        }
+        callbacks = OrchestratorCallbacks(**callback_kwargs)
+
+        abort_run(
+            store,
+            run_id="run-1",
+            reason="external trigger",
+            callbacks=callbacks,
+            status=abort_status,
+        )
+
+        assert captured == [1]
+
+    def test_completion_progress_failure_is_recoverable(self) -> None:
+        nodes = [
+            make_node("fetch", slug="a"),
+            make_node("process", slug="b", depends_on=["a"]),
+        ]
+        store = _FailingProgressStore()
+        store.setup_run("run-1", nodes)
+        store.setup_task("task-a", "run-1", 0, "fetch", TaskStatus.COMPLETED)
+        store.setup_task("task-b", "run-1", 1, "process", TaskStatus.COMPLETED)
+        callbacks, tracker = _make_callbacks()
+
+        with pytest.raises(RuntimeError, match="simulated DB failure"):
+            on_task_complete(
+                store,
+                task_id="task-b",
+                callbacks=callbacks,
+                resolve_passthrough=_no_passthrough,
+            )
+
+        assert store._run_status["run-1"] == RunStatus.RUNNING
+        assert tracker["completed"] == []
+
+        on_task_complete(
+            store,
+            task_id="task-b",
+            callbacks=callbacks,
+            resolve_passthrough=_no_passthrough,
+        )
+
+        assert store._run_status["run-1"] == RunStatus.COMPLETED
+        assert tracker["completed"] == ["run-1"]
+        assert store._run_progress["run-1"] == 2
+
+    def test_on_task_failed_progress_failure_is_recoverable(self) -> None:
+        nodes = [
+            make_node("fetch", slug="a"),
+            make_node("process", slug="b", depends_on=["a"]),
+        ]
+        store = _FailingProgressStore()
+        store.setup_run("run-1", nodes)
+        store.setup_task("task-a", "run-1", 0, "fetch", TaskStatus.COMPLETED)
+        store.setup_task("task-b", "run-1", 1, "process", TaskStatus.RUNNING)
+        callbacks, tracker = _make_callbacks()
+
+        with pytest.raises(RuntimeError, match="simulated DB failure"):
+            on_task_failed(
+                store,
+                task_id="task-b",
+                error_message="plugin crashed",
+                callbacks=callbacks,
+            )
+
+        assert store._run_status["run-1"] == RunStatus.RUNNING
+        assert tracker["failed"] == []
+
+        on_task_failed(
+            store,
+            task_id="task-b",
+            error_message="plugin crashed",
+            callbacks=callbacks,
+        )
+
+        assert store._run_status["run-1"] == RunStatus.FAILED
+        assert tracker["failed"] == ["run-1"]
+        assert store._run_progress["run-1"] == 2

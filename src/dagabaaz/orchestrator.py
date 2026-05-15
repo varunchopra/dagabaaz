@@ -389,6 +389,7 @@ def reconcile_run(
                 store.dispatch_failed_task(
                     run_id, node_idx, topology.nodes[node_idx].plugin, result.error
                 )
+                store.set_run_progress(run_id, len(completed_nodes))
                 if store.try_claim_run_terminal(run_id, RunStatus.FAILED, result.error):
                     callbacks.on_run_failed(run_id)
                     _evict_topology(run_id)
@@ -408,6 +409,7 @@ def reconcile_run(
                 changed_indices.add(node_idx)
 
     if len(completed_nodes) >= len(topology.nodes):
+        store.set_run_progress(run_id, len(completed_nodes))
         if not store.try_claim_run_terminal(run_id, RunStatus.COMPLETED):
             logger.info("Run %s already terminal, skipping completion", run_id)
             return
@@ -488,6 +490,7 @@ def on_task_failed(
     if not run_id:
         return
 
+    store.set_run_progress(run_id, len(store.get_completed_node_indices(run_id)))
     if not store.try_claim_run_terminal(run_id, RunStatus.FAILED, error_message):
         logger.info("Run %s already terminal, skipping failure handling", run_id)
         return
@@ -510,6 +513,7 @@ def on_task_crashed(
     if not run_id:
         return
 
+    store.set_run_progress(run_id, len(store.get_completed_node_indices(run_id)))
     if not store.try_claim_run_terminal(run_id, RunStatus.CRASHED, error_message):
         logger.info("Run %s already terminal, skipping crash handling", run_id)
         return
@@ -539,6 +543,7 @@ def abort_run(
             f"abort_run status must be FAILED, CRASHED, or CANCELLED, got {status}"
         )
 
+    store.set_run_progress(run_id, len(store.get_completed_node_indices(run_id)))
     if not store.try_claim_run_terminal(run_id, status, reason):
         logger.info("Run %s already terminal, skipping abort", run_id)
         return False
