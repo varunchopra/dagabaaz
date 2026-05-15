@@ -18,8 +18,10 @@ class RetryBoundary:
     These get their non-completed tasks deleted and re-dispatched.
 
     ``downstream``: launched non-completed nodes without failures, plus
-    unlaunched nodes. These get all tasks and node_launches wiped so the
-    orchestrator can rediscover them as upstream tasks complete.
+    unlaunched nodes. These get all tasks and node_launches wiped. The
+    caller must invoke ``orchestrator.reconcile_run`` after ``retry_run``
+    returns to rediscover them — a downstream node whose parent finished
+    before the retry will not be reached by any future completion event.
     """
 
     failed: list[int]
@@ -89,6 +91,10 @@ def retry_run(
     Uses the pre-computed ``RetryBoundary`` to know which nodes to touch.
     Returns a ``RetryResult`` mapping old_task_id → new_task_id for
     caller bookkeeping (attempt archival, billing adjustment).
+
+    State mutation only — the caller must invoke
+    ``orchestrator.reconcile_run`` after this returns so downstream nodes
+    whose parents already completed get dispatched.
 
     Preserves the dispatch method: tasks with ``origin_artifact_id``
     are re-dispatched via ``dispatch_grouped_task``; others via

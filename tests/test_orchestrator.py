@@ -8,6 +8,7 @@ from dagabaaz.orchestrator import (
     on_task_complete,
     on_task_crashed,
     on_task_failed,
+    reconcile_run,
     start_run,
 )
 from tests.helpers import MockDagStore, make_dag_artifact, make_node
@@ -375,6 +376,36 @@ class TestOnTaskComplete:
         assert len(store.filtered_nodes) == 0
         assert tracker["completed"] == ["run-1"]
 
+    def test_stranded_downstream_discovered_after_unrelated_event(self) -> None:
+        """Just-completed node has no children; readiness must still discover
+        a node whose parent completed in an earlier turn."""
+        nodes = [
+            make_node("root", slug="a"),
+            make_node("parallel_left", slug="b", depends_on=["a"]),
+            make_node("retry_target", slug="c", depends_on=["a"]),
+            make_node("downstream_of_b", slug="d", depends_on=["b"]),
+        ]
+        store = MockDagStore()
+        store.setup_run("run-1", nodes)
+        store.setup_task("task-a", "run-1", 0, "root", TaskStatus.COMPLETED)
+        store.setup_task("task-b", "run-1", 1, "parallel_left", TaskStatus.COMPLETED)
+        store.setup_task("task-c", "run-1", 2, "retry_target", TaskStatus.COMPLETED)
+        store.setup_artifacts("run-1", 0, [make_dag_artifact("from_a.dat")])
+        store.setup_artifacts("run-1", 1, [make_dag_artifact("from_b.dat")])
+        store.setup_artifacts("run-1", 2, [make_dag_artifact("from_c.dat")])
+        callbacks, tracker = _make_callbacks()
+
+        on_task_complete(
+            store,
+            task_id="task-c",
+            callbacks=callbacks,
+            resolve_passthrough=_no_passthrough,
+        )
+
+        assert len(store.dispatched_tasks) == 1
+        assert store.dispatched_tasks[0].node_index == 3
+        assert tracker["completed"] == []
+
     def test_gate_rejection_grouped_does_not_skip(self) -> None:
         """GROUPED node with an edge filter that rejects all artifacts produces
         a filter (not a skip) — grouped nodes don't skip-cascade."""
@@ -414,6 +445,31 @@ class TestOnTaskComplete:
         assert len(store.filtered_nodes) == 1
         assert store.filtered_nodes[0].node_index == 1
         assert tracker["completed"] == ["run-1"]
+
+
+class TestReconcileRun:
+    def test_dispatches_ready_nodes_without_preceding_event(self) -> None:
+        """Direct invocation (e.g. from retry caller) discovers nodes whose
+        parents completed before any event the engine has seen."""
+        nodes = [
+            make_node("root", slug="a"),
+            make_node("child", slug="b", depends_on=["a"]),
+        ]
+        store = MockDagStore()
+        store.setup_run("run-1", nodes)
+        store.setup_task("task-a", "run-1", 0, "root", TaskStatus.COMPLETED)
+        store.setup_artifacts("run-1", 0, [make_dag_artifact("output.dat")])
+        callbacks, tracker = _make_callbacks()
+
+        reconcile_run(
+            store,
+            "run-1",
+            callbacks=callbacks,
+            resolve_passthrough=_no_passthrough,
+        )
+
+        assert len(store.dispatched_tasks) == 1
+        assert store.dispatched_tasks[0].node_index == 1
 
 
 class TestOnTaskFailed:

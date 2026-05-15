@@ -3,6 +3,10 @@
 Key algorithms:
 - Barrier sync: a node is ready when ALL its dependency nodes have all
   tasks completed/skipped/filtered.
+- Reconciliation: readiness is computed from persisted state, not from
+  the just-completed event. ``on_task_complete`` and external callers
+  (e.g. retry) both delegate to ``reconcile_run``, which discovers every
+  ready node regardless of which prior event last touched its parents.
 - Skip cascade: if any dependency is fully skipped (upstream dead), the
   downstream node is also skipped. Cascades through the entire subgraph.
 - Filtered (non-cascading): when a node has no artifacts, it is marked
@@ -302,53 +306,27 @@ def _launch_node(
     return LaunchResult(task_count, "launched")
 
 
-def on_task_complete(
+def reconcile_run(
     store: DagStore,
+    run_id: str,
     *,
-    task_id: str,
     callbacks: OrchestratorCallbacks,
     resolve_passthrough: ResolvePassthrough,
 ) -> None:
-    """Handle task completion with DAG-aware scheduling.
+    """Launch every node whose dependencies are now satisfied.
 
-    Called after a task finishes successfully. Checks if all sibling tasks
-    at the same node are done, then finds all newly-ready downstream nodes
-    and launches them. Multiple nodes can be launched in parallel.
+    Readiness is computed against persisted state, so callers don't need
+    to tell the engine which node just changed. Safe to call after any
+    state mutation (task completion, retry, manual intervention) and safe
+    to call redundantly — node-launch claims are atomic. No-op on terminal
+    runs.
 
-    The launch loop handles multi-level skip cascades: skipping a node
-    may unlock further downstream nodes, so we loop until no more nodes
-    become ready. Each iteration is O(nodes) for readiness + O(1) store
-    operations per launched/skipped node.
-
-    Can trigger ``on_run_completed`` (all nodes done), ``on_run_failed``
-    (fan-out limit exceeded or similar fatal error during downstream
-    launch), or ``on_run_crashed`` (not currently — crashes come from
-    the worker via ``on_task_crashed``). The ``OrchestratorCallbacks``
-    dataclass carries all three so callers don't need to remember which
-    subset each function needs.
+    Can trigger ``on_run_completed`` (all nodes done) or ``on_run_failed``
+    (fan-out limit exceeded or similar fatal error during launch).
     """
-    ctx = store.get_task_context(task_id)
-    if not ctx:
-        logger.error("Task %s not found", task_id)
-        return
-
-    run_id = ctx.run_id
-    node_index = ctx.node_index
-
-    run_status, total_tasks, completed_tasks = store.get_barrier_state(
-        run_id, node_index
-    )
+    run_status = store.get_run_status(run_id)
     if run_status in RUN_TERMINAL_STATUSES:
         logger.info("Run %s is %s, skipping orchestration", run_id, run_status)
-        return
-
-    if completed_tasks < total_tasks:
-        logger.info(
-            "Node %d: %d/%d tasks done, waiting for siblings",
-            node_index,
-            completed_tasks,
-            total_tasks,
-        )
         return
 
     # Reuse cached topology when available — nodes are immutable per run,
@@ -363,14 +341,16 @@ def on_task_complete(
 
     completed_nodes = store.get_completed_node_indices(run_id)
     launched_nodes = store.get_launched_node_indices(run_id)
-
     node_completion_map = store.get_node_summary(run_id)
 
     total_new_tasks = 0
     all_launched = set(launched_nodes)
     ready_node_indices: list[int] = []
-    # Track which nodes just completed for targeted children lookup
-    changed_indices: set[int] = {node_index}
+    # First iteration scans the whole graph — a parent may have completed
+    # in an earlier turn (e.g. before a retry), so children-of-recent-change
+    # is not a complete frontier. Subsequent iterations narrow to nodes
+    # whose state we just changed (skip/filter cascade).
+    changed_indices: set[int] | None = None
 
     while True:
         ready = find_ready_nodes(
@@ -383,8 +363,6 @@ def on_task_complete(
         if not ready:
             break
 
-        # Reset for next iteration — only nodes processed in this iteration
-        # can unlock further downstream nodes.
         changed_indices = set()
 
         for node_idx in ready:
@@ -421,8 +399,6 @@ def on_task_complete(
                 return
 
             if result.tasks_created == 0:
-                # Skip/filter: update in-memory state so the next iteration
-                # sees this node as completed without re-querying the DB.
                 completed_nodes.add(node_idx)
                 node_completion_map[node_idx] = (
                     NodeSummaryStatus.SKIPPED
@@ -452,6 +428,51 @@ def on_task_complete(
         len(ready_node_indices),
         ready_node_indices,
         total_new_tasks,
+    )
+
+
+def on_task_complete(
+    store: DagStore,
+    *,
+    task_id: str,
+    callbacks: OrchestratorCallbacks,
+    resolve_passthrough: ResolvePassthrough,
+) -> None:
+    """Handle task completion: wait for the sibling barrier, then reconcile.
+
+    Multiple sibling tasks at the same node finish independently; only the
+    final one triggers downstream launches. Once the barrier is met, the
+    actual readiness/launch work is delegated to ``reconcile_run``.
+    """
+    ctx = store.get_task_context(task_id)
+    if not ctx:
+        logger.error("Task %s not found", task_id)
+        return
+
+    run_id = ctx.run_id
+    node_index = ctx.node_index
+
+    run_status, total_tasks, completed_tasks = store.get_barrier_state(
+        run_id, node_index
+    )
+    if run_status in RUN_TERMINAL_STATUSES:
+        logger.info("Run %s is %s, skipping orchestration", run_id, run_status)
+        return
+
+    if completed_tasks < total_tasks:
+        logger.info(
+            "Node %d: %d/%d tasks done, waiting for siblings",
+            node_index,
+            completed_tasks,
+            total_tasks,
+        )
+        return
+
+    reconcile_run(
+        store,
+        run_id,
+        callbacks=callbacks,
+        resolve_passthrough=resolve_passthrough,
     )
 
 
