@@ -27,33 +27,50 @@ def assign_slugs(nodes: list[DagNode]) -> None:
 
 
 def build_slug_to_index_map(nodes: list[DagNode]) -> dict[str, int]:
-    """Map node slugs to their array positions.
-
-    Used at every runtime boundary where slug-based references need
-    to be converted to index-based lookups.
-    """
-    return {node.slug: i for i, node in enumerate(nodes) if node.slug}
+    """Map non-empty, unique node slugs to their array positions."""
+    slug_to_index: dict[str, int] = {}
+    for node_idx, node in enumerate(nodes):
+        if not node.slug:
+            raise ValueError(f"Node at index {node_idx} has an empty slug")
+        if node.slug in slug_to_index:
+            raise ValueError(f"Duplicate node slug {node.slug!r}")
+        slug_to_index[node.slug] = node_idx
+    return slug_to_index
 
 
 def resolve_dependency_indices(nodes: list[DagNode]) -> list[list[int]]:
-    """Convert slug-based depends_on to index-based lists for runtime.
+    """Assign missing slugs and convert dependencies to runtime indices.
 
     Pipeline definitions use slugs for stable references. The runtime
     (orchestrator, worker, tasks DB) stays index-based. This function
     is the conversion boundary.
 
-    Raises ``ValueError`` if a dependency is unknown or the graph contains a cycle.
+    Raises ``ValueError`` if the graph definition is invalid.
     """
+    assign_slugs(nodes)
     index = build_slug_to_index_map(nodes)
     result: list[list[int]] = []
     for node in nodes:
         deps: list[int] = []
+        dependency_slugs: set[str] = set()
         for dependency_slug in node.depends_on:
+            if dependency_slug in dependency_slugs:
+                raise ValueError(
+                    f"Repeated dependency slug {dependency_slug!r} "
+                    f"in node {node.slug!r}"
+                )
+            dependency_slugs.add(dependency_slug)
             if dependency_slug not in index:
                 raise ValueError(
                     f"Unknown dependency slug {dependency_slug!r} in node {node.slug!r}"
                 )
             deps.append(index[dependency_slug])
+        for dependency_slug in node.edge_filters:
+            if dependency_slug not in dependency_slugs:
+                raise ValueError(
+                    f"Edge filter slug {dependency_slug!r} is not a direct dependency "
+                    f"of node {node.slug!r}"
+                )
         result.append(deps)
     if _has_dependency_cycle(result):
         raise ValueError("Pipeline contains a dependency cycle")
@@ -75,24 +92,11 @@ def rekey_edge_filters_by_index(
     node: DagNode,
     slug_to_index: dict[str, int],
 ) -> dict[int, EdgeFilter]:
-    """Convert slug-keyed edge_filters to index-keyed for runtime.
-
-    Edge filters are stored keyed by dependency slug in the pipeline
-    definition. At runtime, artifact queries use node indices, so
-    filter keys must be converted. Unknown slugs are dropped with a
-    debug log — pipeline validation should catch these at creation time.
-    """
-    result: dict[int, EdgeFilter] = {}
-    for slug, edge_filter in node.edge_filters.items():
-        if slug in slug_to_index:
-            result[slug_to_index[slug]] = edge_filter
-        else:
-            logger.debug(
-                "Edge filter slug %r not found in slug map for node %r, dropping",
-                slug,
-                node.slug,
-            )
-    return result
+    """Convert validated slug-keyed edge filters to index-keyed filters."""
+    return {
+        slug_to_index[dependency_slug]: edge_filter
+        for dependency_slug, edge_filter in node.edge_filters.items()
+    }
 
 
 def build_children(deps: list[list[int]]) -> list[list[int]]:

@@ -44,10 +44,6 @@ class TestBuildSlugIndex:
         nodes = [_node("a", slug="a_1"), _node("b", slug="b_1")]
         assert build_slug_to_index_map(nodes) == {"a_1": 0, "b_1": 1}
 
-    def test_skips_empty_slugs(self) -> None:
-        nodes = [_node("a", slug="a_1"), _node("b")]
-        assert build_slug_to_index_map(nodes) == {"a_1": 0}
-
 
 class TestNormalizeDependencies:
     def test_linear_chain(self) -> None:
@@ -85,15 +81,6 @@ class TestResolveEdgeFilters:
         resolved = rekey_edge_filters_by_index(node, slug_index)
         assert 0 in resolved
         assert resolved[0] == ef
-
-    def test_unknown_slug_dropped(self) -> None:
-        ef = EdgeFilter(
-            rules=[FilterRule(field="file_type", operator="eq", value="video")]
-        )
-        node = _node("encode", edge_filters={"ghost": ef})
-        resolved = rekey_edge_filters_by_index(node, {"dl_1": 0})
-        assert resolved == {}
-
 
 class TestFindReadyNodes:
     def test_root_nodes_ready_initially(self) -> None:

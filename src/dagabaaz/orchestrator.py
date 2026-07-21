@@ -95,8 +95,7 @@ def start_run(
     ``try_claim_node_launch``, and dispatched with no input artifact
     (root tasks receive the user's run input instead).
 
-    Raises ``ValueError`` if a dependency is unknown, the graph contains a cycle,
-    or the pipeline has no nodes.
+    Raises ``ValueError`` if the graph definition is invalid or empty.
     """
     root_indices = find_root_nodes(nodes)
     if not root_indices:
@@ -115,7 +114,7 @@ def start_run(
     return root_indices  # Full set — callers need structural info
 
 
-def _collect_and_filter_per_edge(  # NOTE: task_input.py has a parallel version for TaskArtifact
+def _collect_and_filter_per_edge(
     store: DagStore,
     run_id: str,
     dependency_indices: list[int],

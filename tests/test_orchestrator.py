@@ -1,7 +1,7 @@
 import pytest
 
 from dagabaaz.constants import FanMode, RunStatus, TaskStatus
-from dagabaaz.models import EdgeFilter, FilterRule
+from dagabaaz.models import DagNode, EdgeFilter, FilterRule
 from dagabaaz.orchestrator import (
     OrchestratorCallbacks,
     abort_run,
@@ -69,6 +69,17 @@ class TestStartRun:
         assert len(store.dispatched_tasks) == 2
         assert {t.node_index for t in store.dispatched_tasks} == {0, 1}
 
+    def test_missing_slug_is_assigned_before_dispatch(self) -> None:
+        nodes = [make_node("source")]
+        store = MockDagStore()
+        store.setup_run("run-1", nodes)
+
+        result = start_run(store, "run-1", nodes)
+
+        assert result == [0]
+        assert nodes[0].slug == "source_1"
+        assert len(store.dispatched_tasks) == 1
+
     def test_dependency_cycle_rejected_before_dispatch(self) -> None:
         nodes = [
             make_node("root", slug="root"),
@@ -92,6 +103,47 @@ class TestStartRun:
         store.setup_run("run-1", nodes)
 
         with pytest.raises(ValueError, match="Unknown dependency slug"):
+            start_run(store, "run-1", nodes)
+
+        assert store.dispatched_tasks == []
+        assert store.get_launched_node_indices("run-1") == set()
+
+    @pytest.mark.parametrize(
+        "nodes",
+        [
+            [make_node("first", slug="same"), make_node("second", slug="same")],
+            [
+                make_node("source", slug="source"),
+                make_node(
+                    "sink",
+                    slug="sink",
+                    depends_on=["source", "source"],
+                ),
+            ],
+            [
+                make_node("source", slug="source"),
+                make_node("other", slug="other"),
+                make_node(
+                    "sink",
+                    slug="sink",
+                    depends_on=["source"],
+                    edge_filters={"other": EdgeFilter()},
+                ),
+            ],
+        ],
+        ids=[
+            "duplicate-slug",
+            "repeated-dependency",
+            "filter-on-non-dependency",
+        ],
+    )
+    def test_ambiguous_graph_rejected_before_dispatch(
+        self, nodes: list[DagNode]
+    ) -> None:
+        store = MockDagStore()
+        store.setup_run("run-1", nodes)
+
+        with pytest.raises(ValueError):
             start_run(store, "run-1", nodes)
 
         assert store.dispatched_tasks == []
