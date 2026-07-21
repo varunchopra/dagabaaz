@@ -69,16 +69,20 @@ class TestStartRun:
         assert len(store.dispatched_tasks) == 2
         assert {t.node_index for t in store.dispatched_tasks} == {0, 1}
 
-    def test_no_root_nodes_raises(self) -> None:
+    def test_dependency_cycle_rejected_before_dispatch(self) -> None:
         nodes = [
+            make_node("root", slug="root"),
             make_node("a", slug="a", depends_on=["b"]),
             make_node("b", slug="b", depends_on=["a"]),
         ]
         store = MockDagStore()
         store.setup_run("run-1", nodes)
 
-        with pytest.raises(ValueError, match="no root nodes"):
+        with pytest.raises(ValueError, match="dependency cycle"):
             start_run(store, "run-1", nodes)
+
+        assert store.dispatched_tasks == []
+        assert store.get_launched_node_indices("run-1") == set()
 
     def test_unknown_dependency_rejected_before_dispatch(self) -> None:
         nodes = [

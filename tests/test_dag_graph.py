@@ -153,13 +153,6 @@ class TestFindRootNodes:
         nodes = [_node("a", slug="a_1"), _node("b", slug="b_1")]
         assert find_root_nodes(nodes) == [0, 1]
 
-    def test_no_roots(self) -> None:
-        nodes = [
-            _node("a", slug="a_1", depends_on=["b_1"]),
-            _node("b", slug="b_1", depends_on=["a_1"]),
-        ]
-        assert find_root_nodes(nodes) == []
-
     def test_empty_graph(self) -> None:
         assert find_root_nodes([]) == []
 

@@ -42,7 +42,7 @@ def resolve_dependency_indices(nodes: list[DagNode]) -> list[list[int]]:
     (orchestrator, worker, tasks DB) stays index-based. This function
     is the conversion boundary.
 
-    Raises ``ValueError`` if a dependency references an unknown slug.
+    Raises ``ValueError`` if a dependency is unknown or the graph contains a cycle.
     """
     index = build_slug_to_index_map(nodes)
     result: list[list[int]] = []
@@ -55,6 +55,8 @@ def resolve_dependency_indices(nodes: list[DagNode]) -> list[list[int]]:
                 )
             deps.append(index[dependency_slug])
         result.append(deps)
+    if _has_dependency_cycle(result):
+        raise ValueError("Pipeline contains a dependency cycle")
     return result
 
 
@@ -106,6 +108,29 @@ def build_children(deps: list[list[int]]) -> list[list[int]]:
         for parent_idx in parents:
             children[parent_idx].append(child_idx)
     return children
+
+
+def _has_dependency_cycle(dependency_indices: list[list[int]]) -> bool:
+    children = build_children(dependency_indices)
+    unresolved_dependency_counts = [
+        len(parent_indices) for parent_indices in dependency_indices
+    ]
+    ready_node_indices = [
+        node_idx
+        for node_idx, dependency_count in enumerate(unresolved_dependency_counts)
+        if dependency_count == 0
+    ]
+    resolved_node_count = 0
+
+    while ready_node_indices:
+        node_idx = ready_node_indices.pop()
+        resolved_node_count += 1
+        for child_idx in children[node_idx]:
+            unresolved_dependency_counts[child_idx] -= 1
+            if unresolved_dependency_counts[child_idx] == 0:
+                ready_node_indices.append(child_idx)
+
+    return resolved_node_count != len(dependency_indices)
 
 
 def find_ready_nodes(

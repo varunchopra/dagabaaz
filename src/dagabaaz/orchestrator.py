@@ -95,11 +95,12 @@ def start_run(
     ``try_claim_node_launch``, and dispatched with no input artifact
     (root tasks receive the user's run input instead).
 
-    Raises ``ValueError`` if a dependency is unknown or the pipeline has no roots.
+    Raises ``ValueError`` if a dependency is unknown, the graph contains a cycle,
+    or the pipeline has no nodes.
     """
     root_indices = find_root_nodes(nodes)
     if not root_indices:
-        raise ValueError("Pipeline has no root nodes (circular dependencies?)")
+        raise ValueError("Pipeline has no nodes")
 
     dispatched: list[int] = []
     for node_idx in root_indices:
