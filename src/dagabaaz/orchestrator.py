@@ -95,7 +95,7 @@ def start_run(
     ``try_claim_node_launch``, and dispatched with no input artifact
     (root tasks receive the user's run input instead).
 
-    Raises ``ValueError`` if the pipeline has no root nodes.
+    Raises ``ValueError`` if a dependency is unknown or the pipeline has no roots.
     """
     root_indices = find_root_nodes(nodes)
     if not root_indices:

@@ -80,6 +80,19 @@ class TestStartRun:
         with pytest.raises(ValueError, match="no root nodes"):
             start_run(store, "run-1", nodes)
 
+    def test_unknown_dependency_rejected_before_dispatch(self) -> None:
+        nodes = [
+            make_node("publish", slug="publish", depends_on=["authenticate_typo"]),
+        ]
+        store = MockDagStore()
+        store.setup_run("run-1", nodes)
+
+        with pytest.raises(ValueError, match="Unknown dependency slug"):
+            start_run(store, "run-1", nodes)
+
+        assert store.dispatched_tasks == []
+        assert store.get_launched_node_indices("run-1") == set()
+
     def test_claim_race_skips_already_claimed(self) -> None:
         nodes = [make_node("fetch", slug="a")]
         store = MockDagStore()

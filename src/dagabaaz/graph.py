@@ -42,23 +42,18 @@ def resolve_dependency_indices(nodes: list[DagNode]) -> list[list[int]]:
     (orchestrator, worker, tasks DB) stays index-based. This function
     is the conversion boundary.
 
-    Unknown slugs are logged and dropped. Pipeline validation should
-    catch these at creation time, but the engine must not crash at
-    runtime if one slips through.
+    Raises ``ValueError`` if a dependency references an unknown slug.
     """
     index = build_slug_to_index_map(nodes)
     result: list[list[int]] = []
     for node in nodes:
         deps: list[int] = []
         for dependency_slug in node.depends_on:
-            if dependency_slug in index:
-                deps.append(index[dependency_slug])
-            else:
-                logger.warning(
-                    "Unknown dependency slug %r in node %r, ignoring",
-                    dependency_slug,
-                    node.slug,
+            if dependency_slug not in index:
+                raise ValueError(
+                    f"Unknown dependency slug {dependency_slug!r} in node {node.slug!r}"
                 )
+            deps.append(index[dependency_slug])
         result.append(deps)
     return result
 

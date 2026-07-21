@@ -69,11 +69,6 @@ class TestNormalizeDependencies:
         deps = resolve_dependency_indices(nodes)
         assert deps == [[], [0], [0], [1, 2]]
 
-    def test_unknown_slug_ignored(self) -> None:
-        nodes = [_node("a", slug="a_1", depends_on=["nonexistent"])]
-        deps = resolve_dependency_indices(nodes)
-        assert deps == [[]]
-
     def test_no_deps(self) -> None:
         nodes = [_node("a", slug="a_1"), _node("b", slug="b_1")]
         deps = resolve_dependency_indices(nodes)
