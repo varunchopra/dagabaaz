@@ -54,7 +54,7 @@ def collect_upstream_task_artifacts_bfs(
     )
 
 
-def _collect_and_filter_per_edge(  # NOTE: orchestrator.py has a parallel version for DagArtifact
+def _collect_and_filter_per_edge(
     store: TaskInputStore,
     run_id: str,
     dep_indices: list[int],
@@ -63,12 +63,6 @@ def _collect_and_filter_per_edge(  # NOTE: orchestrator.py has a parallel versio
     *,
     passthrough_indices: set[int] | None = None,
 ) -> list[TaskArtifact]:
-    """Collect artifacts per dependency edge, apply per-edge filters, merge.
-
-    Iterates each dependency independently so per-edge filters apply to
-    the correct subset. Uses BFS directly for each edge — it checks the
-    first level itself, so no redundant pre-query is needed.
-    """
     all_artifacts: list[TaskArtifact] = []
 
     for dep_idx in dep_indices:
@@ -91,6 +85,32 @@ def _collect_and_filter_per_edge(  # NOTE: orchestrator.py has a parallel versio
     return all_artifacts
 
 
+def _collect_grouped_artifacts_bfs(
+    store: TaskInputStore,
+    run_id: str,
+    dependency_index: int,
+    dep_adjacency: list[list[int]],
+    origin_artifact_id: str,
+    passthrough_indices: set[int] | None,
+) -> list[TaskArtifact]:
+    def fetch_group(
+        current_run_id: str, node_indices: list[int]
+    ) -> list[TaskArtifact]:
+        grouped = store.get_grouped_artifacts(
+            current_run_id, node_indices, origin_artifact_id
+        )
+        broadcast = store.get_broadcast_artifacts(current_run_id, node_indices)
+        return grouped + broadcast
+
+    return bfs_collect(
+        fetch_group,
+        run_id,
+        [dependency_index],
+        dep_adjacency,
+        passthrough_indices=passthrough_indices,
+    )
+
+
 def build_task_input(
     store: TaskInputStore,
     *,
@@ -102,30 +122,14 @@ def build_task_input(
     origin_artifact_id: str | None = None,
     passthrough_indices: set[int] | None = None,
 ) -> dict[str, object]:
-    """Build the input data dict for a task.
-
-    Four dispatch paths based on how the task was created:
-
-    - **Fan-out** (``input_artifact_id`` set): Single artifact's fields
-      spread into a flat dict. Most common path for SINGLE fan mode.
-    - **Grouped** (``origin_artifact_id`` set, has deps): Correlated
-      subset of upstream artifacts plus broadcast artifacts, returned
-      as ``{"artifacts": [...]}``.
-    - **Root** (no dependencies): The run's user-provided input.
-    - **Aggregate/dependency** (has deps, no input artifact): All
-      upstream artifacts via passthrough-aware BFS, with optional
-      per-edge filtering, returned as ``{"artifacts": [...]}``.
-    """
-    # Fan-out: single artifact → flat dict
     if input_artifact_id:
         art = store.get_artifact_data(input_artifact_id)
         if not art:
             return {}
-        # Spread metadata first, then set standard fields LAST so
-        # metadata keys can't overwrite file_path/file_name.
         input_data: dict[str, object] = {}
         if art.metadata:
             input_data.update(art.metadata)
+        # Standard fields override colliding metadata keys.
         input_data["file_path"] = art.file_path
         input_data["file_name"] = art.file_name
         if art.file_size is not None:
@@ -137,16 +141,37 @@ def build_task_input(
     if deps is None:
         deps = resolve_dependency_indices(nodes) if nodes else []
     dep_indices = deps[node_index] if node_index < len(deps) else []
+    node_def = nodes[node_index] if node_index < len(nodes) else None
+    edge_filters = (
+        rekey_edge_filters_by_index(node_def, build_slug_to_index_map(nodes))
+        if node_def and node_def.edge_filters
+        else {}
+    )
 
-    # Grouped: correlated artifacts + broadcast → list
     if origin_artifact_id and dep_indices:
-        grouped = store.get_grouped_artifacts(run_id, dep_indices, origin_artifact_id)
-        broadcast = store.get_broadcast_artifacts(run_id, dep_indices)
-        all_grouped = grouped + broadcast
-        if all_grouped:
-            return {"artifacts": [a.to_input_dict() for a in all_grouped]}
-        # Dependency node with no artifacts — return empty artifacts list
-        # rather than run_input (which is meant for root nodes only).
+        grouped_artifacts: list[TaskArtifact] = []
+        for dependency_index in dep_indices:
+            dependency_artifacts = _collect_grouped_artifacts_bfs(
+                store,
+                run_id,
+                dependency_index,
+                deps,
+                origin_artifact_id,
+                passthrough_indices,
+            )
+            edge_filter = edge_filters.get(dependency_index)
+            if edge_filter and (edge_filter.rules or edge_filter.select):
+                dependency_artifacts = filter_artifacts(
+                    dependency_artifacts, edge_filter
+                )
+            grouped_artifacts.extend(dependency_artifacts)
+
+        if grouped_artifacts:
+            return {
+                "artifacts": [
+                    artifact.to_input_dict() for artifact in grouped_artifacts
+                ]
+            }
         logger.warning(
             "Grouped task at node %d has no artifacts (run=%s, origin=%s)",
             node_index,
@@ -155,17 +180,9 @@ def build_task_input(
         )
         return {"artifacts": []}
 
-    # Root: no dependencies → run input.
-    # Defensive copy — resolve_task_bindings mutates input_data in place.
     if not dep_indices:
+        # Bindings mutate input_data in place.
         return dict(store.get_run_input(run_id))
-
-    # Aggregate/dependency: BFS collect with optional edge filters
-    node_def = nodes[node_index] if node_index < len(nodes) else None
-    slug_to_index = build_slug_to_index_map(nodes)
-    edge_filters = (
-        rekey_edge_filters_by_index(node_def, slug_to_index) if node_def else {}
-    )
 
     if edge_filters:
         upstream_artifacts = _collect_and_filter_per_edge(
@@ -193,8 +210,6 @@ def build_task_input(
     if upstream_artifacts:
         return {"artifacts": [a.to_input_dict() for a in upstream_artifacts]}
 
-    # Dependency node with no artifacts — return empty artifacts list
-    # rather than run_input (which is meant for root nodes only).
     logger.warning(
         "Dependency node %d has no artifacts after BFS (run=%s)",
         node_index,

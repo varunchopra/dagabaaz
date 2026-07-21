@@ -1,6 +1,6 @@
 import pytest
 
-from dagabaaz.constants import FanMode, RunStatus, TaskStatus
+from dagabaaz.constants import ArtifactSelector, FanMode, RunStatus, TaskStatus
 from dagabaaz.models import DagNode, EdgeFilter, FilterRule
 from dagabaaz.orchestrator import (
     OrchestratorCallbacks,
@@ -344,6 +344,136 @@ class TestOnTaskComplete:
         }
         assert len(store.dispatched_tasks) == 0
         assert tracker["completed"] == []
+
+    def test_grouped_selector_dispatches_each_matching_origin(self) -> None:
+        nodes = [
+            make_node("source", slug="a"),
+            make_node(
+                "merge",
+                slug="b",
+                depends_on=["a"],
+                edge_filters={
+                    "a": EdgeFilter(select=ArtifactSelector.LARGEST),
+                },
+                fan_mode=FanMode.GROUPED,
+            ),
+        ]
+        store = MockDagStore()
+        store.setup_run("run-1", nodes)
+        store.setup_task("task-a", "run-1", 0, "source", TaskStatus.COMPLETED)
+        store.setup_artifacts(
+            "run-1",
+            0,
+            [
+                make_dag_artifact(
+                    "origin-1-small.dat", size=100, origin_artifact_id="origin-1"
+                ),
+                make_dag_artifact(
+                    "origin-1-large.dat", size=200, origin_artifact_id="origin-1"
+                ),
+                make_dag_artifact(
+                    "origin-2-small.dat", size=300, origin_artifact_id="origin-2"
+                ),
+                make_dag_artifact(
+                    "origin-2-large.dat", size=400, origin_artifact_id="origin-2"
+                ),
+            ],
+        )
+        callbacks, _ = _make_callbacks()
+
+        on_task_complete(
+            store,
+            task_id="task-a",
+            callbacks=callbacks,
+            resolve_passthrough=_no_passthrough,
+        )
+
+        assert {task.origin_artifact_id for task in store.grouped_tasks} == {
+            "origin-1",
+            "origin-2",
+        }
+
+    def test_grouped_selector_compares_broadcast_per_origin(self) -> None:
+        nodes = [
+            make_node("source", slug="a"),
+            make_node(
+                "merge",
+                slug="b",
+                depends_on=["a"],
+                edge_filters={
+                    "a": EdgeFilter(select=ArtifactSelector.LARGEST),
+                },
+                fan_mode=FanMode.GROUPED,
+            ),
+        ]
+        store = MockDagStore()
+        store.setup_run("run-1", nodes)
+        store.setup_task("task-a", "run-1", 0, "source", TaskStatus.COMPLETED)
+        store.setup_artifacts(
+            "run-1",
+            0,
+            [
+                make_dag_artifact(
+                    "origin-1.dat", size=100, origin_artifact_id="origin-1"
+                ),
+                make_dag_artifact(
+                    "origin-2.dat", size=300, origin_artifact_id="origin-2"
+                ),
+                make_dag_artifact("broadcast.dat", size=200),
+            ],
+        )
+        callbacks, _ = _make_callbacks()
+
+        on_task_complete(
+            store,
+            task_id="task-a",
+            callbacks=callbacks,
+            resolve_passthrough=_no_passthrough,
+        )
+
+        assert [task.origin_artifact_id for task in store.grouped_tasks] == [
+            "origin-2"
+        ]
+
+    def test_grouped_fan_out_limit_fails_run(self) -> None:
+        nodes = [
+            make_node("source", slug="a"),
+            make_node(
+                "merge",
+                slug="b",
+                depends_on=["a"],
+                edge_filters={
+                    "a": EdgeFilter(select=ArtifactSelector.LARGEST),
+                },
+                fan_mode=FanMode.GROUPED,
+            ),
+        ]
+        store = MockDagStore()
+        store.setup_run("run-1", nodes)
+        store.setup_task("task-a", "run-1", 0, "source", TaskStatus.COMPLETED)
+        artifacts = [
+            make_dag_artifact(
+                f"origin-{index}.dat",
+                size=1000 + index,
+                origin_artifact_id=f"origin-{index}",
+            )
+            for index in range(201)
+        ]
+        artifacts.append(make_dag_artifact("broadcast.dat", size=1))
+        store.setup_artifacts("run-1", 0, artifacts)
+        callbacks, tracker = _make_callbacks()
+
+        on_task_complete(
+            store,
+            task_id="task-a",
+            callbacks=callbacks,
+            resolve_passthrough=_no_passthrough,
+        )
+
+        assert store.grouped_tasks == []
+        assert len(store.failed_nodes) == 1
+        assert "Grouped fan-out limit" in store.failed_nodes[0].error
+        assert tracker["failed"] == ["run-1"]
 
     def test_terminal_run_short_circuits(self) -> None:
         nodes = [make_node("fetch", slug="a")]

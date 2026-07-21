@@ -365,31 +365,11 @@ def filter_artifacts[A: DagArtifactLike](
 
 @dataclass(frozen=True, slots=True)
 class OriginGroups:
-    """Grouped artifacts separated from broadcast artifacts.
-
-    Avoids the ``"__broadcast__"`` magic-string sentinel that could leak
-    as a UUID foreign key into dispatch calls. Broadcast artifacts (NULL
-    origin) are appended to every real group during construction. If ALL
-    artifacts are broadcast, ``groups`` is empty and the caller falls
-    back to aggregate dispatch.
-    """
-
     groups: dict[str, list[DagArtifact]]
     broadcast: list[DagArtifact]
 
 
 def group_by_origin(artifacts: list[DagArtifact]) -> OriginGroups:
-    """Group artifacts by origin_artifact_id for grouped fan-in dispatch.
-
-    Groups the already-BFS-collected artifacts by their origin key.
-
-    Broadcast handling: artifacts with ``origin_artifact_id = None`` come
-    from aggregate-mode nodes or nodes outside a fan-out chain. These are
-    appended to every real group as shared context.
-
-    If ALL artifacts are broadcast (no origin tracking), ``groups`` is
-    empty and the caller falls back to aggregate dispatch.
-    """
     groups: dict[str, list[DagArtifact]] = defaultdict(list)
     broadcast: list[DagArtifact] = []
 
@@ -398,16 +378,6 @@ def group_by_origin(artifacts: list[DagArtifact]) -> OriginGroups:
             broadcast.append(art)
         else:
             groups[art.origin_artifact_id].append(art)
-
-    # Append broadcast artifacts to every real group so each grouped
-    # task sees shared context alongside its correlated data.
-    # Build new lists to avoid aliasing — in-place extend would mutate
-    # the defaultdict values and share broadcast object references.
-    # The number of groups is bounded by MAX_FAN_OUT (checked by
-    # the orchestrator's GROUPED dispatch branch), so this copy is
-    # O(MAX_FAN_OUT * B) where B = len(broadcast) — at most 200 groups.
-    if broadcast and groups:
-        groups = {k: v + broadcast for k, v in groups.items()}
 
     return OriginGroups(groups=dict(groups), broadcast=broadcast)
 

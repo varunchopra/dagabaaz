@@ -1,6 +1,14 @@
 import pytest
 
-from dagabaaz.models import ConfigSource, DagNode, NodeSource, TaskArtifact
+from dagabaaz.constants import ArtifactSelector, FilterOperator
+from dagabaaz.models import (
+    ConfigSource,
+    DagNode,
+    EdgeFilter,
+    FilterRule,
+    NodeSource,
+    TaskArtifact,
+)
 from dagabaaz.store import TaskInputStore
 from dagabaaz.task_input import (
     build_task_input,
@@ -25,6 +33,27 @@ def _art(
         mime_type=mime_type,
         metadata=metadata or {},
         origin_artifact_id=origin_artifact_id,
+    )
+
+
+def _file_type_filter(file_type: str) -> EdgeFilter:
+    return EdgeFilter(
+        rules=[FilterRule(field="file_type", operator=FilterOperator.EQ, value=file_type)]
+    )
+
+
+def _grouped_artifact(
+    file_name: str,
+    *,
+    origin_id: str | None = "origin-1",
+    file_size: int = 1000,
+    mime_type: str = "application/octet-stream",
+) -> TaskArtifact:
+    return _art(
+        file_name=file_name,
+        file_size=file_size,
+        mime_type=mime_type,
+        origin_artifact_id=origin_id,
     )
 
 
@@ -62,11 +91,27 @@ class MockTaskInputStore:
     def get_grouped_artifacts(
         self, run_id: str, dep_indices: list[int], origin_id: str
     ) -> list[TaskArtifact]:
+        node_map = self._artifacts_by_node.get(run_id)
+        if node_map is not None:
+            return [
+                artifact
+                for node_index in dep_indices
+                for artifact in node_map.get(node_index, [])
+                if artifact.origin_artifact_id == origin_id
+            ]
         return self._grouped.get(origin_id, [])
 
     def get_broadcast_artifacts(
         self, run_id: str, dep_indices: list[int]
     ) -> list[TaskArtifact]:
+        node_map = self._artifacts_by_node.get(run_id)
+        if node_map is not None:
+            return [
+                artifact
+                for node_index in dep_indices
+                for artifact in node_map.get(node_index, [])
+                if artifact.origin_artifact_id is None
+            ]
         return self._broadcast.get(run_id, [])
 
     def get_run_input(self, run_id: str) -> dict[str, object]:
@@ -85,6 +130,38 @@ class MockTaskInputStore:
 assert isinstance(
     MockTaskInputStore(), TaskInputStore
 ), "MockTaskInputStore does not satisfy TaskInputStore protocol"
+
+
+def _build_grouped_input(
+    artifacts_by_node: dict[int, list[TaskArtifact]],
+    edge_filters: dict[str, EdgeFilter],
+) -> dict[str, object]:
+    dependency_slugs = [
+        f"source-{node_index}" for node_index in sorted(artifacts_by_node)
+    ]
+    nodes = [
+        _node("source", slug=dependency_slug)
+        for dependency_slug in dependency_slugs
+    ]
+    nodes.append(
+        _node(
+            "sink",
+            slug="sink",
+            depends_on=dependency_slugs,
+            edge_filters=edge_filters,
+        )
+    )
+    store = MockTaskInputStore(
+        artifacts_by_node={"run-1": artifacts_by_node},
+    )
+    return build_task_input(
+        store,
+        run_id="run-1",
+        node_index=len(nodes) - 1,
+        input_artifact_id=None,
+        origin_artifact_id="origin-1",
+        nodes=nodes,
+    )
 
 
 class TestBuildTaskInputFanOut:
@@ -263,6 +340,70 @@ class TestBuildTaskInputGrouped:
         )
 
         assert result == {"artifacts": []}
+
+    def test_each_dependency_filters_correlated_and_broadcast_artifacts(self) -> None:
+        source_a_video = _grouped_artifact("source-a.mp4", mime_type="video/mp4")
+        source_b_subtitle = _grouped_artifact("source-b.srt")
+        result = _build_grouped_input(
+            {
+                0: [
+                    source_a_video,
+                    _grouped_artifact("source-a.srt"),
+                    _grouped_artifact("source-a-broadcast.srt", origin_id=None),
+                ],
+                1: [
+                    _grouped_artifact("source-b.jpg", mime_type="image/jpeg"),
+                    source_b_subtitle,
+                ],
+            },
+            {
+                "source-0": _file_type_filter("video"),
+                "source-1": _file_type_filter("subtitle"),
+            },
+        )
+
+        assert result == {
+            "artifacts": [
+                source_a_video.to_input_dict(),
+                source_b_subtitle.to_input_dict(),
+            ]
+        }
+
+    @pytest.mark.parametrize(
+        "selector,target_size,local_size,remote_size",
+        [
+            (ArtifactSelector.LARGEST, 200, 100, 300),
+            (ArtifactSelector.SMALLEST, 100, 200, 50),
+        ],
+    )
+    def test_selector_applies_within_origin_group(
+        self,
+        selector: ArtifactSelector,
+        target_size: int,
+        local_size: int,
+        remote_size: int,
+    ) -> None:
+        target = _grouped_artifact("target.dat", file_size=target_size)
+        group_anchor = _grouped_artifact("anchor.dat")
+        result = _build_grouped_input(
+            {
+                0: [
+                    target,
+                    _grouped_artifact("local.dat", file_size=local_size),
+                    _grouped_artifact(
+                        "remote.dat",
+                        file_size=remote_size,
+                        origin_id="origin-2",
+                    ),
+                ],
+                1: [group_anchor],
+            },
+            {"source-0": EdgeFilter(select=selector)},
+        )
+
+        assert result == {
+            "artifacts": [target.to_input_dict(), group_anchor.to_input_dict()]
+        }
 
 
 class TestCollectUpstreamBfsPassthrough:

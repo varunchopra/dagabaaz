@@ -1,7 +1,7 @@
 import pytest
 from pydantic import ValidationError
 
-from dagabaaz.filter import filter_artifacts, group_by_origin
+from dagabaaz.filter import filter_artifacts
 from dagabaaz.models import EdgeFilter, FilterRule
 from tests.helpers import make_dag_artifact as _art
 
@@ -489,45 +489,3 @@ def test_gt_on_bool_returns_false() -> None:
     arts = [_art("a.mp4", 100, None, {"flag": True})]
     ef = EdgeFilter(rules=[FilterRule(field="flag", operator="gt", value=0)])
     assert filter_artifacts(arts, ef) == []
-
-
-class TestGroupByOrigin:
-    """Direct tests for group_by_origin broadcast and grouping semantics."""
-
-    def test_groups_by_origin_id(self) -> None:
-        arts = [
-            _art("a.dat", origin_artifact_id="o1"),
-            _art("b.dat", origin_artifact_id="o1"),
-            _art("c.dat", origin_artifact_id="o2"),
-        ]
-        result = group_by_origin(arts)
-        assert len(result.groups) == 2
-        assert len(result.groups["o1"]) == 2
-        assert len(result.groups["o2"]) == 1
-        assert result.broadcast == []
-
-    def test_broadcast_appended_to_every_group(self) -> None:
-        arts = [
-            _art("a.dat", origin_artifact_id="o1"),
-            _art("b.dat", origin_artifact_id="o2"),
-            _art("shared.dat", origin_artifact_id=None),
-        ]
-        result = group_by_origin(arts)
-        assert len(result.groups) == 2
-        for group_arts in result.groups.values():
-            names = {a.file_name for a in group_arts}
-            assert "shared.dat" in names
-
-    def test_all_broadcast_returns_empty_groups(self) -> None:
-        arts = [
-            _art("x.dat", origin_artifact_id=None),
-            _art("y.dat", origin_artifact_id=None),
-        ]
-        result = group_by_origin(arts)
-        assert result.groups == {}
-        assert len(result.broadcast) == 2
-
-    def test_empty_input(self) -> None:
-        result = group_by_origin([])
-        assert result.groups == {}
-        assert result.broadcast == []

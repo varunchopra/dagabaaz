@@ -168,6 +168,60 @@ def _collect_and_filter_per_edge(
     return all_artifacts, is_gate_rejected
 
 
+def _collect_grouped_origin_ids(
+    store: DagStore,
+    run_id: str,
+    dependency_indices: list[int],
+    dep_adjacency: list[list[int]],
+    edge_filters: dict[int, EdgeFilter],
+    passthrough_indices: set[int] | None,
+) -> tuple[list[str], bool]:
+    origin_ids: dict[str, None] = {}
+    has_broadcast = False
+
+    for dependency_index in dependency_indices:
+        artifacts = collect_upstream_artifacts_bfs(
+            store,
+            run_id,
+            [dependency_index],
+            dep_adjacency,
+            passthrough_indices=passthrough_indices,
+        )
+        grouped = group_by_origin(artifacts)
+        edge_filter = edge_filters.get(dependency_index)
+        selector_filter = (
+            EdgeFilter(select=edge_filter.select)
+            if edge_filter and edge_filter.select
+            else None
+        )
+
+        filtered_broadcast = grouped.broadcast
+        if edge_filter and (edge_filter.rules or edge_filter.select):
+            filtered_broadcast = filter_artifacts(grouped.broadcast, edge_filter)
+        has_broadcast = has_broadcast or bool(filtered_broadcast)
+
+        for origin_id, correlated in grouped.groups.items():
+            if edge_filter and (edge_filter.rules or edge_filter.select):
+                filtered_correlated = filter_artifacts(correlated, edge_filter)
+                if selector_filter:
+                    candidates = filtered_correlated + filtered_broadcast
+                    filtered_correlated = filter_artifacts(
+                        candidates, selector_filter
+                    )
+            else:
+                filtered_correlated = correlated
+
+            if (
+                filtered_correlated
+                and filtered_correlated[0].origin_artifact_id == origin_id
+            ):
+                origin_ids.setdefault(origin_id, None)
+                if len(origin_ids) > MAX_FAN_OUT:
+                    return list(origin_ids), has_broadcast
+
+    return list(origin_ids), has_broadcast
+
+
 def _launch_node(
     store: DagStore,
     *,
@@ -213,6 +267,34 @@ def _launch_node(
                     dep_idx,
                 )
                 return LaunchResult(0, "skipped")
+
+    if fan_mode == FanMode.GROUPED and dependency_indices:
+        origin_ids, has_broadcast = _collect_grouped_origin_ids(
+            store,
+            run_id,
+            dependency_indices,
+            deps,
+            edge_filters,
+            passthrough_indices,
+        )
+        if len(origin_ids) > MAX_FAN_OUT:
+            error = (
+                f"Grouped fan-out limit exceeded: "
+                f"{len(origin_ids)} groups (max {MAX_FAN_OUT})"
+            )
+            logger.error("Node %d: %s", node_index, error)
+            return LaunchResult(0, "failed", error)
+        if origin_ids:
+            for origin_id in origin_ids:
+                store.dispatch_grouped_task(
+                    run_id, node_index, plugin_name, origin_id
+                )
+            return LaunchResult(len(origin_ids), "launched")
+        if has_broadcast:
+            store.dispatch_task(run_id, node_index, plugin_name, None)
+            return LaunchResult(1, "launched")
+        store.dispatch_filtered_task(run_id, node_index, plugin_name)
+        return LaunchResult(0, "filtered")
 
     is_gate_rejected = False
     if not edge_filters:
@@ -276,31 +358,8 @@ def _launch_node(
             task_count = 1
 
         case FanMode.GROUPED:
-            # One task per origin group — scatter-gather correlation.
-            # Group the ALREADY-COLLECTED artifacts by origin. Artifacts were
-            # collected via BFS (which handles passthrough traversal), so we
-            # group the results in Python — no separate query needed.
-            result = group_by_origin(artifacts)
-            if not result.groups:
-                # All artifacts are broadcast — no origin grouping possible.
-                # Fall back to aggregate dispatch so the node still executes.
-                store.dispatch_task(run_id, node_index, plugin_name, None)
-                task_count = 1
-            elif len(result.groups) > MAX_FAN_OUT:
-                # Same guard as SINGLE mode — fail loudly rather than
-                # silently creating hundreds of grouped tasks.
-                error = (
-                    f"Grouped fan-out limit exceeded: "
-                    f"{len(result.groups)} groups (max {MAX_FAN_OUT})"
-                )
-                logger.error("Node %d: %s", node_index, error)
-                return LaunchResult(0, "failed", error)
-            else:
-                for origin_id in result.groups:
-                    store.dispatch_grouped_task(
-                        run_id, node_index, plugin_name, origin_id
-                    )
-                    task_count += 1
+            store.dispatch_task(run_id, node_index, plugin_name, None)
+            task_count = 1
 
     logger.info("Launched node %d with %d task(s)", node_index, task_count)
     return LaunchResult(task_count, "launched")
