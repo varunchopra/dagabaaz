@@ -230,15 +230,7 @@ def resolve_task_bindings(
     input_artifact_id: str | None = None,
     origin_artifact_id: str | None = None,
 ) -> None:
-    """Resolve bindings and merge into input_data (mutates in place).
-
-    Bindings are an overlay: applied AFTER ``build_task_input``, so they
-    can override values from artifacts or run input. This lets pipeline
-    designers wire specific values between nodes explicitly.
-
-    For grouped tasks, artifacts are filtered by origin so each task
-    sees only its own correlated data.
-    """
+    """Resolve bindings into input_data in place."""
     if node_index >= len(nodes):
         return
 
@@ -275,11 +267,18 @@ def resolve_task_bindings(
         else:
             artifacts_by_node = {}
 
-    # Grouped origin filter: each grouped task sees only its correlated data.
     if origin_artifact_id and artifacts_by_node:
         artifacts_by_node = filter_artifacts_by_origin(
             artifacts_by_node, origin_artifact_id
         )
+
+    edge_filters = rekey_edge_filters_by_index(current_node, slug_to_index)
+    for dependency_index, edge_filter in edge_filters.items():
+        artifacts = artifacts_by_node.get(dependency_index)
+        if artifacts and (edge_filter.rules or edge_filter.select):
+            artifacts_by_node[dependency_index] = filter_artifacts(
+                artifacts, edge_filter
+            )
 
     run_input = (
         store.get_run_input(run_id) if any_binding_requires_run_input(bindings) else {}

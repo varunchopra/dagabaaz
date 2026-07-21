@@ -1,10 +1,11 @@
 import pytest
 
-from dagabaaz.constants import ArtifactSelector, FilterOperator
+from dagabaaz.constants import ArtifactSelector, FanMode, FilterOperator
 from dagabaaz.models import (
     ConfigSource,
     DagNode,
     EdgeFilter,
+    ExpressionSource,
     FilterRule,
     NodeSource,
     TaskArtifact,
@@ -162,6 +163,32 @@ def _build_grouped_input(
         origin_artifact_id="origin-1",
         nodes=nodes,
     )
+
+
+def _build_resolved_input(
+    store: MockTaskInputStore,
+    nodes: list[DagNode],
+    *,
+    origin_id: str | None = None,
+) -> dict[str, object]:
+    node_index = len(nodes) - 1
+    input_data = build_task_input(
+        store,
+        run_id="run-1",
+        node_index=node_index,
+        input_artifact_id=None,
+        origin_artifact_id=origin_id,
+        nodes=nodes,
+    )
+    resolve_task_bindings(
+        store,
+        run_id="run-1",
+        node_index=node_index,
+        nodes=nodes,
+        input_data=input_data,
+        origin_artifact_id=origin_id,
+    )
+    return input_data
 
 
 class TestBuildTaskInputFanOut:
@@ -471,6 +498,86 @@ def _two_node_run(target_bindings: dict, upstream_metadata: dict | None = None):
         ),
     ]
     return store, nodes
+
+
+class TestResolveTaskBindingsEdgeFilters:
+    def test_artifact_bindings_share_filtered_task_input(self) -> None:
+        video = _art(file_name="movie.mp4", mime_type="video/mp4")
+        subtitle = _art(file_name="movie.srt", metadata={"rejected_flag": "yes"})
+        store = MockTaskInputStore(
+            artifacts_by_node={"run-1": {0: [video, subtitle]}}
+        )
+        nodes = [
+            _node("source", slug="upstream"),
+            DagNode(
+                plugin="target",
+                slug="target",
+                depends_on=["upstream"],
+                edge_filters={"upstream": _file_type_filter("video")},
+                bindings={
+                    "node_name": NodeSource(node="upstream", key="file_name"),
+                    "expression_name": ExpressionSource(
+                        expression="{upstream.file_name}"
+                    ),
+                    "rejected": ConfigSource(
+                        value="leaked",
+                        when="{upstream.rejected_flag}",
+                    ),
+                },
+                fan_mode=FanMode.AGGREGATE,
+            ),
+        ]
+
+        input_data = _build_resolved_input(store, nodes)
+
+        assert input_data == {
+            "artifacts": [video.to_input_dict()],
+            "node_name": "movie.mp4",
+            "expression_name": "movie.mp4",
+        }
+
+    def test_grouped_selector_applies_within_origin_group(self) -> None:
+        group_artifact = _grouped_artifact("target.dat", file_size=100)
+        selected_artifact = _grouped_artifact(
+            "other.dat",
+            file_size=200,
+            origin_id="origin-2",
+        )
+        group_anchor = _grouped_artifact("anchor.dat")
+        store = MockTaskInputStore(
+            artifacts_by_node={
+                "run-1": {
+                    0: [group_artifact, selected_artifact],
+                    1: [group_anchor],
+                }
+            }
+        )
+        nodes = [
+            _node("selected", slug="selected"),
+            _node("anchor", slug="anchor"),
+            DagNode(
+                plugin="target",
+                slug="target",
+                depends_on=["selected", "anchor"],
+                edge_filters={
+                    "selected": EdgeFilter(select=ArtifactSelector.LARGEST)
+                },
+                bindings={
+                    "selected_name": NodeSource(node="selected", key="file_name")
+                },
+                fan_mode=FanMode.GROUPED,
+            ),
+        ]
+
+        input_data = _build_resolved_input(store, nodes, origin_id="origin-1")
+
+        assert input_data == {
+            "artifacts": [
+                group_artifact.to_input_dict(),
+                group_anchor.to_input_dict(),
+            ],
+            "selected_name": "target.dat",
+        }
 
 
 class TestResolveTaskBindingsWhenClause:
