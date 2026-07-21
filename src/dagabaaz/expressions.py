@@ -12,6 +12,7 @@ flows into the pipe chain): ``{list(a.url, b.url) | join(,)}``.
 """
 
 import functools
+import inspect
 import re
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -25,6 +26,22 @@ from dagabaaz.pipes import BUILTIN_PIPES, PIPE_ARITY
 class PipeCall:
     name: str
     args: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class PipeSpec:
+    """Argument names exclude the implicit piped value."""
+
+    name: str
+    min_args: int
+    max_args: int
+    argument_names: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class ExpressionVocabulary:
+    pipes: tuple[PipeSpec, ...]
+    functions: tuple[str, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -47,6 +64,23 @@ _FUNCTION_DISPATCH: dict[str, Callable[[Token, Lookup], object]] = {
 }
 
 _KNOWN_FUNCTIONS = frozenset(_FUNCTION_DISPATCH.keys())
+
+
+def get_expression_vocabulary() -> ExpressionVocabulary:
+    pipe_specs: list[PipeSpec] = []
+    for name, pipe in BUILTIN_PIPES.items():
+        min_args, max_args = PIPE_ARITY[name]
+        pipe_specs.append(
+            PipeSpec(
+                name=name,
+                min_args=min_args,
+                max_args=max_args,
+                argument_names=tuple(inspect.signature(pipe).parameters)[1:],
+            )
+        )
+    return ExpressionVocabulary(
+        pipes=tuple(pipe_specs), functions=tuple(sorted(_KNOWN_FUNCTIONS))
+    )
 
 
 @functools.lru_cache(maxsize=256)

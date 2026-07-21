@@ -5,19 +5,25 @@ import pytest
 from dagabaaz.expressions import (
     ExpressionError,
     PipeCall,
+    PipeSpec,
     Token,
     extract_refs,
+    get_expression_vocabulary,
     resolve_expression,
     tokenize_expression,
     validate_expression,
 )
 from dagabaaz.pipes import BUILTIN_PIPES as _PIPES
-from dagabaaz.pipes import PIPE_ARITY
 
 
-def test_all_pipes_have_arity_entries() -> None:
-    """Every pipe in BUILTIN_PIPES must have a corresponding PIPE_ARITY entry."""
-    assert set(PIPE_ARITY.keys()) == set(_PIPES.keys())
+def test_expression_vocabulary() -> None:
+    vocabulary = get_expression_vocabulary()
+    pipes = {pipe.name: pipe for pipe in vocabulary.pipes}
+
+    assert vocabulary.functions == ("list",)
+    assert pipes["upper"] == PipeSpec("upper", 0, 0, ())
+    assert pipes["replace"] == PipeSpec("replace", 1, 2, ("old", "new"))
+    assert pipes["in"] == PipeSpec("in", 1, 32, ("options",))
 
 
 class TestTokenize:
