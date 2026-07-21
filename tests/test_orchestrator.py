@@ -13,8 +13,6 @@ from dagabaaz.orchestrator import (
 )
 from tests.helpers import MockDagStore, make_dag_artifact, make_node
 
-pytestmark = pytest.mark.usefixtures("reset_topology_cache")
-
 
 def _make_callbacks() -> tuple[OrchestratorCallbacks, dict[str, list[str]]]:
     tracker: dict[str, list[str]] = {
@@ -670,6 +668,35 @@ class TestReconcileRun:
         assert len(store.dispatched_tasks) == 1
         assert store.dispatched_tasks[0].node_index == 1
 
+    def test_same_run_id_uses_each_store_topology(self) -> None:
+        callbacks, _ = _make_callbacks()
+        stores: list[MockDagStore] = []
+
+        for child_plugin in ["first-child", "second-child"]:
+            nodes = [
+                make_node("root", slug="root"),
+                make_node(child_plugin, slug="child", depends_on=["root"]),
+            ]
+            store = MockDagStore()
+            store.setup_run("shared-run", nodes)
+            store.setup_task("root-task", "shared-run", 0, "root")
+            store.setup_artifacts(
+                "shared-run", 0, [make_dag_artifact("output.dat")]
+            )
+
+            reconcile_run(
+                store,
+                "shared-run",
+                callbacks=callbacks,
+                resolve_passthrough=_no_passthrough,
+            )
+            stores.append(store)
+
+        assert [store.dispatched_tasks[0].plugin_name for store in stores] == [
+            "first-child",
+            "second-child",
+        ]
+
 
 class TestOnTaskFailed:
     def test_marks_run_failed_and_cancels(self) -> None:
@@ -836,23 +863,6 @@ class TestAbortRun:
                 callbacks=callbacks,
                 status=RunStatus.COMPLETED,
             )
-
-    def test_evicts_topology_cache(self) -> None:
-        nodes = [make_node("fetch", slug="a")]
-        store = MockDagStore()
-        store.setup_run("run-1", nodes)
-        store.setup_task("task-a", "run-1", 0, "fetch", TaskStatus.RUNNING)
-
-        from dagabaaz.topology import _topology_cache, get_or_build
-
-        get_or_build("run-1", lambda: nodes, lambda _: False)
-        assert "run-1" in _topology_cache
-
-        callbacks, _ = _make_callbacks()
-        abort_run(store, run_id="run-1", reason="timeout", callbacks=callbacks)
-
-        assert "run-1" not in _topology_cache
-
 
 class _FailingProgressStore(MockDagStore):
     """MockDagStore where the first set_run_progress call raises."""

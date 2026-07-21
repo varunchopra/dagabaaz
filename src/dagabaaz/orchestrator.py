@@ -40,8 +40,6 @@ from dagabaaz.graph import (
 from dagabaaz.models import DagArtifact, DagNode, EdgeFilter
 from dagabaaz.store import DagStore
 from dagabaaz.topology import ResolvePassthrough, RunTopology
-from dagabaaz.topology import evict as _evict_topology
-from dagabaaz.topology import get_or_build as _get_or_build_topology
 
 logger = logging.getLogger(__name__)
 
@@ -388,15 +386,11 @@ def reconcile_run(
         logger.info("Run %s is %s, skipping orchestration", run_id, run_status)
         return
 
-    # Reuse cached topology when available — nodes are immutable per run,
-    # so the structural graph data never changes between task completions.
-    # Lazy fetcher avoids a DB round-trip on every call (cache hit path).
-    topology = _get_or_build_topology(
-        run_id, lambda: store.get_run_nodes(run_id), resolve_passthrough
-    )
-    if topology is None:
+    nodes = store.get_run_nodes(run_id)
+    if nodes is None:
         logger.error("Run %s pipeline not found", run_id)
         return
+    topology = RunTopology.build(nodes, resolve_passthrough)
 
     completed_nodes = store.get_completed_node_indices(run_id)
     launched_nodes = store.get_launched_node_indices(run_id)
@@ -451,7 +445,6 @@ def reconcile_run(
                 store.set_run_progress(run_id, len(completed_nodes))
                 if store.try_claim_run_terminal(run_id, RunStatus.FAILED, result.error):
                     callbacks.on_run_failed(run_id)
-                    _evict_topology(run_id)
                     store.cancel_remaining_tasks(run_id, f"Cancelled: {result.error}")
                 logger.error(
                     "Run %s failed at node %d: %s", run_id, node_idx, result.error
@@ -473,7 +466,6 @@ def reconcile_run(
             logger.info("Run %s already terminal, skipping completion", run_id)
             return
         callbacks.on_run_completed(run_id)
-        _evict_topology(run_id)
         logger.info("Run %s completed", run_id)
         return
 
@@ -555,7 +547,6 @@ def on_task_failed(
         return
 
     callbacks.on_run_failed(run_id)
-    _evict_topology(run_id)
     store.cancel_remaining_tasks(run_id, "Cancelled: sibling task failed")
     logger.info("Run %s failed due to task %s: %s", run_id, task_id, error_message)
 
@@ -578,7 +569,6 @@ def on_task_crashed(
         return
 
     callbacks.on_run_crashed(run_id)
-    _evict_topology(run_id)
     store.cancel_remaining_tasks(run_id, "Cancelled: worker crashed")
     logger.info("Run %s crashed due to task %s: %s", run_id, task_id, error_message)
 
@@ -615,7 +605,6 @@ def abort_run(
         case _:
             callbacks.on_run_failed(run_id)
 
-    _evict_topology(run_id)
     store.cancel_remaining_tasks(run_id, f"Cancelled: {reason}")
     logger.info("Run %s aborted (%s): %s", run_id, status.value, reason)
     return True
