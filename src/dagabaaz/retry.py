@@ -1,126 +1,83 @@
-"""Retry logic for the DAG execution engine.
+"""Task retries and run replanning."""
 
-Computes which nodes need re-execution after a failure and drives the
-re-dispatch sequence.
-"""
+from __future__ import annotations
 
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 
-from dagabaaz.models import DagNode
-from dagabaaz.store import DagRetryStore
+from dagabaaz.store import DagRetryStore, RunReopenResult, StoreContractError
 
 
 @dataclass(frozen=True, slots=True)
-class RetryBoundary:
-    """Which nodes need re-execution after a failure.
+class RunRetryResult:
+    """The node indices, generations and retry count committed by a run retry."""
 
-    ``failed``: launched, non-completed nodes with retryable task failures.
-    These get their non-completed tasks deleted and re-dispatched.
+    affected_nodes: tuple[int, ...]
+    generations: Mapping[int, int]
+    retry_count: int
 
-    ``downstream``: launched non-completed nodes without failures, plus
-    unlaunched nodes. These get all tasks and node_launches wiped. The
-    caller must invoke ``orchestrator.reconcile_run`` after ``retry_run``
-    returns to rediscover them — a downstream node whose parent finished
-    before the retry will not be reached by any future completion event.
+
+class RetryRejectedError(RuntimeError):
+    """The run no longer permits the requested retry."""
+
+
+def retry_task(
+    store: DagRetryStore,
+    task_id: str,
+    *,
+    expected_attempt_id: str,
+) -> str | None:
+    """A current crashed attempt may be replaced while its run remains active.
+
+    The store creates a replacement only if ``expected_attempt_id`` is still
+    current, and reuses the task's plan and generation. Success also creates the
+    replacement queue outbox row; rejection returns ``None``.
     """
 
-    failed: list[int]
-    downstream: list[int]
-
-
-@dataclass(frozen=True, slots=True)
-class RetryableTaskInfo:
-    """Minimal task info needed for retry re-dispatch decisions."""
-
-    task_id: str
-    node_index: int
-    plugin_name: str
-    input_artifact_id: str | None
-    origin_artifact_id: str | None
-    status: str
-
-
-@dataclass(frozen=True, slots=True)
-class RetryResult:
-    """Outcome of engine-level retry: old task ID → new task ID."""
-
-    replacement_map: dict[str, str]
-
-
-def compute_retry_boundary(
-    completed_nodes: set[int],
-    launched_nodes: set[int],
-    node_count: int,
-    node_has_retryable_failure: dict[int, bool],
-) -> RetryBoundary:
-    """Compute which nodes need re-execution from a failure point.
-
-    Partitions the graph into three zones:
-    - Completed: nodes where all tasks succeeded. Left untouched.
-    - Failed: launched, non-completed nodes with retryable failures.
-    - Downstream: everything else. Wiped and rediscovered.
-    """
-    non_completed = launched_nodes - completed_nodes
-    failed: list[int] = []
-    downstream: list[int] = []
-
-    for idx in sorted(non_completed):
-        if node_has_retryable_failure.get(idx, False):
-            failed.append(idx)
-        else:
-            downstream.append(idx)
-
-    unlaunched = [
-        i
-        for i in range(node_count)
-        if i not in launched_nodes and i not in completed_nodes
-    ]
-    downstream.extend(unlaunched)
-
-    return RetryBoundary(failed=failed, downstream=downstream)
+    return store.try_create_task_retry(task_id, expected_attempt_id=expected_attempt_id)
 
 
 def retry_run(
     store: DagRetryStore,
     run_id: str,
-    nodes: list[DagNode],
-    boundary: RetryBoundary,
-) -> RetryResult:
-    """Delete failed/downstream tasks and re-dispatch failed ones.
+    boundary_indices: Iterable[int] | None = None,
+) -> RunRetryResult:
+    """A failed, crashed or cancelled run is reopened.
 
-    Uses the pre-computed ``RetryBoundary`` to know which nodes to touch.
-    Returns a ``RetryResult`` mapping old_task_id → new_task_id for
-    caller bookkeeping (attempt archival, billing adjustment).
-
-    State mutation only — the caller must invoke
-    ``orchestrator.reconcile_run`` after this returns so downstream nodes
-    whose parents already completed get dispatched.
-
-    Preserves the dispatch method: tasks with ``origin_artifact_id``
-    are re-dispatched via ``dispatch_grouped_task``; others via
-    ``dispatch_task``.
+    The optional boundary is an assertion about active failed launches. The
+    store discovers affected launches and descendants after acquiring the run
+    lock, then commits the retry count, generations and invalidations together.
+    Reconciliation and application cleanup may begin only after that operation
+    succeeds.
     """
-    replacement_map: dict[str, str] = {}
 
-    if boundary.failed:
-        store.delete_node_launches(run_id, boundary.failed)
-        all_tasks = store.get_retryable_tasks(run_id, boundary.failed)
-        store.delete_non_completed_tasks_at_nodes(run_id, boundary.failed)
+    boundary: tuple[int, ...] | None = None
+    if boundary_indices is not None:
+        supplied = tuple(boundary_indices)
+        if not supplied:
+            raise ValueError("a supplied retry boundary must not be empty")
+        wrong_types = [index for index in supplied if type(index) is not int]
+        if wrong_types:
+            raise ValueError(f"boundary node indices must be integers: {wrong_types!r}")
+        invalid = sorted({index for index in supplied if index < 0})
+        if invalid:
+            raise ValueError(f"boundary contains invalid node indices {invalid!r}")
+        boundary = tuple(sorted(set(supplied)))
 
-        for task in all_tasks:
-            plugin_name = nodes[task.node_index].plugin
-            if task.origin_artifact_id:
-                new_id = store.dispatch_grouped_task(
-                    run_id, task.node_index, plugin_name, task.origin_artifact_id
-                )
-            else:
-                new_id = store.dispatch_task(
-                    run_id, task.node_index, plugin_name, task.input_artifact_id
-                )
-            replacement_map[task.task_id] = new_id
-
-    if boundary.downstream:
-        store.delete_node_launches(run_id, boundary.downstream)
-        store.delete_tasks_at_nodes(run_id, boundary.downstream)
-
-    return RetryResult(replacement_map=replacement_map)
+    reopened = store.try_reopen_run(run_id, boundary)
+    if reopened is None:
+        raise RetryRejectedError(f"run {run_id!r} is not retryable or its retry state became stale")
+    if not isinstance(reopened, RunReopenResult):
+        raise StoreContractError("run retry did not return a RunReopenResult")
+    generation_indices = set(reopened.generations)
+    if generation_indices != set(reopened.affected_nodes):
+        raise StoreContractError(
+            "run retry returned a different generation set; "
+            f"expected={list(reopened.affected_nodes)!r}, "
+            f"actual={sorted(generation_indices)!r}"
+        )
+    return RunRetryResult(
+        affected_nodes=reopened.affected_nodes,
+        generations=reopened.generations,
+        retry_count=reopened.retry_count,
+    )

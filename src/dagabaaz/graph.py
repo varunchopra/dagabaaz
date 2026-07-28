@@ -1,262 +1,170 @@
-"""Graph algorithms for DAG pipelines — slug assignment, dependency resolution,
-readiness detection, and BFS artifact collection.
-"""
+"""Graph validation and readiness checks for named edges."""
 
-import logging
-from collections.abc import Callable
+from __future__ import annotations
 
-from dagabaaz.constants import MAX_BFS_DEPTH
-from dagabaaz.models import DagArtifact, DagNode, EdgeFilter
-from dagabaaz.store import DagStore
+from collections import deque
+from collections.abc import Iterable, Sequence
 
-logger = logging.getLogger(__name__)
-
-
-def assign_slugs(nodes: list[DagNode]) -> None:
-    """Ensure every node has a slug. Modifies in-place. Idempotent."""
-    existing = {node.slug for node in nodes if node.slug}
-    counters: dict[str, int] = {}
-    for node in nodes:
-        if not node.slug:
-            counter = counters.get(node.plugin, 0) + 1
-            while f"{node.plugin}_{counter}" in existing:
-                counter += 1
-            node.slug = f"{node.plugin}_{counter}"
-            existing.add(node.slug)
-            counters[node.plugin] = counter
+from dagabaaz.constants import CorrelationMode, InputMode, InputRole
+from dagabaaz.models import DagNode
+from dagabaaz.schema import validate_binding_references
 
 
 def build_slug_to_index_map(nodes: list[DagNode]) -> dict[str, int]:
-    """Map non-empty, unique node slugs to their array positions."""
-    slug_to_index: dict[str, int] = {}
-    for node_idx, node in enumerate(nodes):
+    """Each non-empty, unique node slug maps to its run-local index."""
+
+    result: dict[str, int] = {}
+    for index, node in enumerate(nodes):
         if not node.slug:
-            raise ValueError(f"Node at index {node_idx} has an empty slug")
-        if node.slug in slug_to_index:
-            raise ValueError(f"Duplicate node slug {node.slug!r}")
-        slug_to_index[node.slug] = node_idx
-    return slug_to_index
-
-
-def resolve_dependency_indices(nodes: list[DagNode]) -> list[list[int]]:
-    """Assign missing slugs and convert dependencies to runtime indices.
-
-    Pipeline definitions use slugs for stable references. The runtime
-    (orchestrator, worker, tasks DB) stays index-based. This function
-    is the conversion boundary.
-
-    Raises ``ValueError`` if the graph definition is invalid.
-    """
-    assign_slugs(nodes)
-    index = build_slug_to_index_map(nodes)
-    result: list[list[int]] = []
-    for node in nodes:
-        deps: list[int] = []
-        dependency_slugs: set[str] = set()
-        for dependency_slug in node.depends_on:
-            if dependency_slug in dependency_slugs:
-                raise ValueError(
-                    f"Repeated dependency slug {dependency_slug!r} "
-                    f"in node {node.slug!r}"
-                )
-            dependency_slugs.add(dependency_slug)
-            if dependency_slug not in index:
-                raise ValueError(
-                    f"Unknown dependency slug {dependency_slug!r} in node {node.slug!r}"
-                )
-            deps.append(index[dependency_slug])
-        for dependency_slug in node.edge_filters:
-            if dependency_slug not in dependency_slugs:
-                raise ValueError(
-                    f"Edge filter slug {dependency_slug!r} is not a direct dependency "
-                    f"of node {node.slug!r}"
-                )
-        result.append(deps)
-    if _has_dependency_cycle(result):
-        raise ValueError("Pipeline contains a dependency cycle")
+            raise ValueError(f"node at index {index} has an empty slug")
+        if node.slug in result:
+            raise ValueError(f"duplicate node slug {node.slug!r}")
+        result[node.slug] = index
     return result
 
 
-def find_root_nodes(nodes: list[DagNode]) -> list[int]:
-    """Return indices of nodes with no dependencies (root/entry nodes).
+def resolve_dependency_indices(nodes: list[DagNode]) -> list[list[int]]:
+    """Edge sources become run-local node indices.
 
-    A root node has an empty ``depends_on`` list after slug→index
-    resolution. These are the starting points for a run — they receive
-    the user's input and produce the first artifacts.
+    Multiple named edges from the same source produce one graph dependency
+    while remaining separate routing inputs.
     """
-    deps = resolve_dependency_indices(nodes)
-    return [i for i, d in enumerate(deps) if not d]
+
+    slug_to_index = build_slug_to_index_map(nodes)
+    dependencies: list[list[int]] = []
+    for node in nodes:
+        seen: set[int] = set()
+        current: list[int] = []
+        for edge in node.edges:
+            source_index = slug_to_index.get(edge.source)
+            if source_index is None:
+                raise ValueError(
+                    f"node {node.slug!r} edge {edge.name!r} references unknown "
+                    f"source {edge.source!r}"
+                )
+            if source_index not in seen:
+                seen.add(source_index)
+                current.append(source_index)
+        dependencies.append(current)
+    return dependencies
 
 
-def rekey_edge_filters_by_index(
-    node: DagNode,
-    slug_to_index: dict[str, int],
-) -> dict[int, EdgeFilter]:
-    """Convert validated slug-keyed edge filters to index-keyed filters."""
-    return {
-        slug_to_index[dependency_slug]: edge_filter
-        for dependency_slug, edge_filter in node.edge_filters.items()
-    }
+def build_children(dependencies: Sequence[Sequence[int]]) -> list[list[int]]:
+    """Parent-to-child adjacency is derived from the dependency list."""
 
-
-def build_children(deps: list[list[int]]) -> list[list[int]]:
-    """Build the inverse adjacency list (parent → children).
-
-    Given ``deps[i]`` = list of parents for node i, return ``children[j]``
-    = list of nodes that depend on node j. Used by ``find_ready_nodes``
-    to limit readiness checks to direct descendants of newly-completed
-    nodes instead of scanning all N nodes on every call.
-    """
-    children: list[list[int]] = [[] for _ in range(len(deps))]
-    for child_idx, parents in enumerate(deps):
-        for parent_idx in parents:
-            children[parent_idx].append(child_idx)
+    children: list[list[int]] = [[] for _ in dependencies]
+    for child, parents in enumerate(dependencies):
+        for parent in parents:
+            children[parent].append(child)
     return children
 
 
-def _has_dependency_cycle(dependency_indices: list[list[int]]) -> bool:
-    children = build_children(dependency_indices)
-    unresolved_dependency_counts = [
-        len(parent_indices) for parent_indices in dependency_indices
-    ]
-    ready_node_indices = [
-        node_idx
-        for node_idx, dependency_count in enumerate(unresolved_dependency_counts)
-        if dependency_count == 0
-    ]
-    resolved_node_count = 0
+def _normalise_and_validate_graph(
+    nodes: list[DagNode],
+) -> tuple[list[DagNode], list[list[int]]]:
+    if not nodes:
+        raise ValueError("pipeline has no nodes")
 
-    while ready_node_indices:
-        node_idx = ready_node_indices.pop()
-        resolved_node_count += 1
-        for child_idx in children[node_idx]:
-            unresolved_dependency_counts[child_idx] -= 1
-            if unresolved_dependency_counts[child_idx] == 0:
-                ready_node_indices.append(child_idx)
+    # Mutating DagNode.bindings does not run assignment validation. Graph
+    # checks use revalidated copies and do not alter the caller's nodes.
+    normalised_nodes = [DagNode.model_validate(dict(node.__dict__)) for node in nodes]
+    dependencies = resolve_dependency_indices(normalised_nodes)
 
-    return resolved_node_count != len(dependency_indices)
+    for node in normalised_nodes:
+        edge_names: set[str] = set()
+        for edge in node.edges:
+            if edge.name in edge_names:
+                raise ValueError(f"node {node.slug!r} has duplicate edge name {edge.name!r}")
+            edge_names.add(edge.name)
+
+        main_edges = [edge for edge in node.edges if edge.role == InputRole.MAIN]
+        if not node.edges:
+            if node.input_mode not in (None, InputMode.ALL):
+                raise ValueError(f"root node {node.slug!r} must use ALL input mode")
+            input_mode = InputMode.ALL
+        else:
+            if node.input_mode is None:
+                raise ValueError(f"non-root node {node.slug!r} must declare an input mode")
+            input_mode = node.input_mode
+
+        if input_mode == InputMode.EACH:
+            if len(main_edges) != 1 or not main_edges[0].required:
+                raise ValueError(f"EACH node {node.slug!r} requires exactly one required main edge")
+        elif input_mode == InputMode.BY_CORRELATION and not main_edges:
+            raise ValueError(f"BY_CORRELATION node {node.slug!r} requires at least one main edge")
+        if node.correlation_mode == CorrelationMode.INHERIT and input_mode == InputMode.ALL:
+            raise ValueError(f"ALL node {node.slug!r} cannot inherit a correlation ID")
+
+    binding_error = validate_binding_references(normalised_nodes)
+    if binding_error is not None:
+        raise ValueError(binding_error)
+
+    children = build_children(dependencies)
+    remaining_parents = [len(parents) for parents in dependencies]
+    ready = deque(
+        index for index, parent_count in enumerate(remaining_parents) if parent_count == 0
+    )
+    visited = 0
+    while ready:
+        current = ready.popleft()
+        visited += 1
+        for child in children[current]:
+            remaining_parents[child] -= 1
+            if remaining_parents[child] == 0:
+                ready.append(child)
+    if visited != len(normalised_nodes):
+        first = next(index for index, parent_count in enumerate(remaining_parents) if parent_count)
+        raise ValueError(f"cycle detected involving node {normalised_nodes[first].slug!r}")
+    return normalised_nodes, dependencies
+
+
+def validate_graph(nodes: list[DagNode]) -> list[list[int]]:
+    """Validate a graph without changing its nodes.
+
+    Validation covers graph, edge, mode, correlation and binding rules. Cycle
+    detection is iterative, so graph depth does not consume Python stack
+    frames. The returned dependencies use run-local node indices.
+    """
+
+    _normalised_nodes, dependencies = _normalise_and_validate_graph(nodes)
+    return dependencies
+
+
+def find_root_nodes(nodes: list[DagNode]) -> list[int]:
+    """Root node indices have no source dependencies."""
+
+    if not nodes:
+        return []
+    dependencies = validate_graph(nodes)
+    return [index for index, parents in enumerate(dependencies) if not parents]
 
 
 def find_ready_nodes(
-    deps: list[list[int]],
+    dependencies: Sequence[Sequence[int]],
     completed: set[int],
     launched: set[int],
-    *,
-    children: list[list[int]] | None = None,
-    changed_indices: set[int] | None = None,
 ) -> list[int]:
-    """Return node indices whose dependencies are all satisfied.
+    """Ready nodes are unlaunched and have complete source launches."""
 
-    A node is ready when:
-    1. All its dependency indices are in ``completed``
-    2. It hasn't been launched yet (not in ``launched``)
-
-    When ``children`` and ``changed_indices`` are both provided, only
-    direct descendants of the changed nodes are checked — O(C * D)
-    where C = number of children of changed nodes. Falls back to full
-    O(N * D) scan otherwise.
-    """
-    if children is not None and changed_indices is not None:
-        # Targeted check: only inspect children of nodes that just changed.
-        candidates: set[int] = set()
-        for idx in changed_indices:
-            if idx < len(children):
-                candidates.update(children[idx])
-        ready: list[int] = []
-        for i in candidates:
-            if i in launched:
-                continue
-            if all(dep in completed for dep in deps[i]):
-                ready.append(i)
-        # Sort for deterministic launch order — set iteration is unordered.
-        return sorted(ready)
-
-    # Full scan fallback — used on first call or when no children data.
-    ready = []
-    for i, node_deps in enumerate(deps):
-        if i in launched:
-            continue
-        if all(dep in completed for dep in node_deps):
-            ready.append(i)
-    return ready
+    return [
+        index
+        for index, parents in enumerate(dependencies)
+        if index not in launched and all(parent in completed for parent in parents)
+    ]
 
 
-def bfs_collect[A](
-    fetch: Callable[[str, list[int]], list[A]],
-    run_id: str,
-    dependency_indices: list[int],
-    dep_adjacency: list[list[int]],
-    *,
-    passthrough_indices: set[int] | None = None,
-    max_depth: int = MAX_BFS_DEPTH,
-) -> list[A]:
-    """Generic BFS through dependency chain to collect items.
+def downstream_closure(
+    dependencies: Sequence[Sequence[int]], boundary_indices: Iterable[int]
+) -> set[int]:
+    """The downstream closure contains each retry boundary and its descendants."""
 
-    Searches immediate dependency nodes first. If none produced items,
-    walks transitively through each dependency's own deps — but only through
-    **passthrough** nodes (routing nodes like Gate that don't consume data).
-    Non-passthrough nodes are dead ends: if a processing node has no items,
-    BFS stops there and returns empty rather than reaching past it.
-
-    When ``passthrough_indices`` is None, all nodes are walkable (backward
-    compat). BFS guarantees shortest-path: closest ancestor with items wins.
-
-    ``max_depth`` caps traversal to detect cycles.
-
-    **Callers MUST invoke per-edge for independent collection** — passing
-    multiple indices merges results at the first level that has any items,
-    which conflates separate dependency edges.
-    """
-    if not dependency_indices:
-        return []
-
-    search_indices = list(dependency_indices)
-    visited: set[int] = set(dependency_indices)
-    depth = 0
-
-    while search_indices:
-        if depth >= max_depth:
-            logger.error(
-                "BFS depth limit (%d) reached for run %s — possible cycle or malformed graph",
-                max_depth,
-                run_id,
-            )
-            return []
-
-        items = fetch(run_id, search_indices)
-        if items:
-            return items
-
-        next_search: list[int] = []
-        for idx in search_indices:
-            if passthrough_indices is not None and idx not in passthrough_indices:
-                continue
-            if idx < len(dep_adjacency):
-                for dep in dep_adjacency[idx]:
-                    if dep not in visited:
-                        next_search.append(dep)
-                        visited.add(dep)
-        search_indices = next_search
-        depth += 1
-
-    return []
-
-
-def collect_upstream_artifacts_bfs(
-    store: DagStore,
-    run_id: str,
-    dependency_indices: list[int],
-    dep_adjacency: list[list[int]],
-    *,
-    passthrough_indices: set[int] | None = None,
-    max_depth: int = MAX_BFS_DEPTH,
-) -> list[DagArtifact]:
-    """BFS through dependency chain to collect artifacts."""
-    return bfs_collect(
-        store.get_artifacts_by_node_indices,
-        run_id,
-        dependency_indices,
-        dep_adjacency,
-        passthrough_indices=passthrough_indices,
-        max_depth=max_depth,
-    )
+    children = build_children(dependencies)
+    result = set(boundary_indices)
+    frontier = list(result)
+    while frontier:
+        current = frontier.pop()
+        for child in children[current]:
+            if child not in result:
+                result.add(child)
+                frontier.append(child)
+    return result

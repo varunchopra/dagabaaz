@@ -1,195 +1,180 @@
-"""Pipeline input schema generation and binding validation.
+"""Runtime input schema construction and binding validation.
 
-Two sources contribute to the runtime input schema:
-  1. Static plugin declarations (plugin inputs with source="runtime")
-  2. Dynamic bindings on nodes (RuntimeSource and expression input.* refs)
+Schema fields come from plugin runtime declarations, ``RuntimeSource``
+bindings and ``input.*`` references in expressions or ``when`` clauses.
 """
 
-from dataclasses import dataclass
-from typing import Any
+from __future__ import annotations
 
+from dataclasses import dataclass
+
+from dagabaaz.bindings import binding_evaluation_steps
+from dagabaaz.constants import MAX_NODE_BINDING_EVALUATIONS, MAX_RUN_INPUT_BYTES
 from dagabaaz.expressions import extract_refs, validate_expression
-from dagabaaz.models import (
-    DagNode,
-    ExpressionError,
-    ExpressionSource,
-    NodeSource,
-    RuntimeSource,
+from dagabaaz.json import (
+    FrozenDict,
+    JsonInput,
+    JsonValue,
+    bounded_json_size,
+    freeze_json,
+    freeze_object,
 )
+from dagabaaz.models import DagNode, EdgeSource, ExpressionSource, RuntimeSource
 from dagabaaz.plugins import PluginLookup
 
 
 @dataclass(frozen=True, slots=True)
 class InputFieldSpec:
-    """A single field in a pipeline's runtime input schema."""
+    """One field in a pipeline's run-input schema.
+
+    ``default`` accepts JSON input and is frozen during construction.
+    """
 
     name: str
     label: str
     placeholder: str = ""
     required: bool = False
-    default: str = ""
+    default: JsonInput = None
+
+    def __post_init__(self) -> None:
+        if not self.name:
+            raise ValueError("input field name must not be empty")
+        object.__setattr__(self, "default", freeze_json(self.default))
 
 
 def get_pipeline_input_schema(
-    nodes: list[DagNode],
-    plugin_lookup: PluginLookup,
+    nodes: list[DagNode], plugin_lookup: PluginLookup
 ) -> list[InputFieldSpec]:
-    """Collect runtime inputs from all nodes in a pipeline.
+    """The schema contains each run-input field once.
 
-    Two sources of runtime inputs:
-    1. Static plugin declarations (PluginInput with source="runtime")
-    2. Dynamic bindings on nodes (RuntimeSource bindings)
-
-    Static declarations take precedence when names collide.
-    Binding-derived inputs are always optional since upstream steps
-    may provide the value instead.
-
-    ``nodes`` must have ``.plugin`` and ``.bindings`` attributes.
-    ``plugin_lookup`` resolves plugin names to metadata (fan_in, inputs).
+    Plugin declarations are considered before fields inferred from bindings,
+    and the first declaration of a name is retained. Defaults are stored as
+    immutable JSON values.
     """
+
     fields: list[InputFieldSpec] = []
-    seen_names: set[str] = set()
+    seen: set[str] = set()
 
     for node in nodes:
         plugin = plugin_lookup(node.plugin)
-        if not plugin:
+        if plugin is None:
             continue
-        for inp in plugin.get_effective_inputs():
-            if inp.source == "runtime" and inp.name not in seen_names:
-                seen_names.add(inp.name)
+        for item in plugin.get_effective_inputs():
+            if item.source == "runtime" and item.name not in seen:
+                seen.add(item.name)
                 fields.append(
                     InputFieldSpec(
-                        name=inp.name,
-                        label=inp.description,
-                        placeholder=inp.placeholder,
-                        required=inp.required,
+                        name=item.name,
+                        label=item.description,
+                        placeholder=item.placeholder,
+                        required=item.required,
+                        default=item.default,
                     )
                 )
 
     for node in nodes:
-        for binding_key, binding in node.bindings.items():
-            if not isinstance(binding, RuntimeSource):
-                continue
-            input_key = binding.key or binding_key
-            if input_key in seen_names:
-                continue
-            seen_names.add(input_key)
-            label = binding.label or binding_key.replace("_", " ").title()
-            fields.append(
-                InputFieldSpec(
-                    name=input_key,
-                    label=label,
-                    placeholder=binding.placeholder,
-                    required=binding.required,
-                    default=binding.default,
-                )
-            )
-
-    for node in nodes:
-        for binding in node.bindings.values():
-            if not isinstance(binding, ExpressionSource):
-                continue
-            try:
-                _, runtime_keys = extract_refs(binding.expression)
-            except ExpressionError:
-                continue
-            for runtime_key in runtime_keys:
-                if runtime_key in seen_names:
-                    continue
-                seen_names.add(runtime_key)
+        for parameter_name, binding in node.bindings.items():
+            if isinstance(binding, RuntimeSource) and binding.key not in seen:
+                seen.add(binding.key)
                 fields.append(
                     InputFieldSpec(
-                        name=runtime_key,
-                        label=runtime_key.replace("_", " ").title(),
+                        name=binding.key,
+                        label=binding.label or parameter_name.replace("_", " ").title(),
+                        placeholder=binding.placeholder,
+                        required=binding.required,
+                        default=binding.default,
                     )
                 )
-
+            expressions: list[str] = []
+            if isinstance(binding, ExpressionSource):
+                expressions.append(binding.expression)
+            if binding.when is not None:
+                expressions.append(binding.when)
+            for expression in expressions:
+                _edges, input_keys = extract_refs(expression)
+                for key in sorted(input_keys):
+                    if key not in seen:
+                        seen.add(key)
+                        fields.append(InputFieldSpec(name=key, label=key.replace("_", " ").title()))
     return fields
 
 
 def merge_run_input(
     schema_fields: list[InputFieldSpec],
-    default_input: dict[str, Any],
-    run_input: dict[str, Any],
-) -> dict[str, Any]:
-    """Merge binding defaults, pipeline defaults, and user input.
+    default_input: dict[str, object],
+    run_input: dict[str, object],
+) -> FrozenDict:
+    """Schema defaults and supplied run input are validated and merged.
 
-    Precedence (lowest to highest):
-      1. Binding defaults (from ``InputFieldSpec.default``)
-      2. Pipeline default_input (set by pipeline author)
-      3. User run_input (provided at run start)
-
-    User input values of ``None`` or ``""`` are treated as absent and
-    do not override lower-precedence values.
-
-    Raises ``ValueError`` if any required field is missing after merge.
+    Precedence runs from schema defaults to pipeline defaults to supplied run
+    input. ``None`` and an empty string in supplied run input do not replace a
+    lower-precedence value; zero and ``False`` do. The returned JSON object is
+    a frozen copy.
     """
-    binding_defaults = {
-        f.name: f.default for f in schema_fields if f.default not in (None, "")
-    }
-    merged: dict[str, Any] = {**binding_defaults, **default_input}
-    for k, v in run_input.items():
-        if v not in (None, ""):
-            merged[k] = v
 
+    binding_defaults = {
+        field.name: field.default
+        for field in schema_fields
+        if field.default is not None and field.default != ""
+    }
+    merged = {**binding_defaults, **default_input}
+    for key, value in run_input.items():
+        if value is not None and value != "":
+            merged[key] = value
     missing = [
-        f.label
-        for f in schema_fields
-        if f.required and merged.get(f.name) in (None, "")
+        field.label
+        for field in schema_fields
+        if field.required and merged.get(field.name) in (None, "")
     ]
     if missing:
-        raise ValueError(f"Required input missing: {', '.join(missing)}")
+        raise ValueError(f"missing required input: {', '.join(missing)}")
 
-    return merged
+    frozen: dict[str, JsonValue] = {}
+    for key, value in merged.items():
+        if not isinstance(key, str):
+            raise ValueError("run input keys must be strings")
+        try:
+            frozen[key] = freeze_json(value)
+        except ValueError as exc:
+            raise ValueError(f"run input {key!r} is not JSON-compatible: {exc}") from exc
+    result = freeze_object(frozen)
+    if bounded_json_size(result, MAX_RUN_INPUT_BYTES) > MAX_RUN_INPUT_BYTES:
+        raise ValueError(f"run input exceeds the {MAX_RUN_INPUT_BYTES}-byte limit")
+    return result
 
 
-def validate_binding_references(
-    nodes: list[DagNode],
-    slug_to_index: dict[str, int],
-) -> str | None:
-    """Validate structural binding references (slugs, expressions).
+def validate_binding_references(nodes: list[DagNode]) -> str | None:
+    """Validation covers named-edge references in bindings, expressions and conditions."""
 
-    Returns an error message or None.
-    """
-    for i, node in enumerate(nodes):
-        label = node.name or f"Node {i + 1}"
-        dep_set = set(node.depends_on)
-        bindings = node.bindings
+    for index, node in enumerate(nodes):
+        label = node.name or f"Node {index + 1}"
+        edge_names = {edge.name for edge in node.edges}
+        for parameter_name, binding in node.bindings.items():
+            if isinstance(binding, EdgeSource) and binding.edge not in edge_names:
+                return (
+                    f"{label}: binding {parameter_name!r} references unknown edge {binding.edge!r}"
+                )
 
-        for field_name, binding in bindings.items():
-            if isinstance(binding, NodeSource):
-                # NodeSource must reference a slug that is in this node's
-                # depends_on — otherwise it silently resolves to None at
-                # runtime, which is almost never intentional.
-                if binding.node not in dep_set:
-                    return (
-                        f"{label}: binding '{field_name}' references node "
-                        f"'{binding.node}' which is not in depends_on"
-                    )
-            elif isinstance(binding, ExpressionSource):
-                expr_err = validate_expression(binding.expression)
-                if expr_err:
-                    return (
-                        f"{label}: binding '{field_name}' expression error: {expr_err}"
-                    )
-                # Safe: validate_expression above already caught tokenization errors
-                expr_slugs, _ = extract_refs(binding.expression)
-                for slug in expr_slugs:
-                    if slug not in dep_set:
-                        return f"{label}: expression references '{slug}' which is not in depends_on"
-
+            expressions: list[tuple[str, str]] = []
+            if isinstance(binding, ExpressionSource):
+                expressions.append(("expression", binding.expression))
             if binding.when:
-                when_err = validate_expression(binding.when)
-                if when_err:
+                expressions.append(("when-clause", binding.when))
+            for kind, expression in expressions:
+                error = validate_expression(expression)
+                if error:
+                    return f"{label}: binding {parameter_name!r} {kind} error: {error}"
+                referenced_edges, _runtime_keys = extract_refs(expression)
+                unknown = referenced_edges - edge_names
+                if unknown:
                     return (
-                        f"{label}: binding '{field_name}' when-clause error: {when_err}"
+                        f"{label}: binding {parameter_name!r} {kind} references "
+                        f"unknown edges {sorted(unknown)!r}"
                     )
-                when_slugs, _ = extract_refs(binding.when)
-                for slug in when_slugs:
-                    if slug not in dep_set:
-                        return (
-                            f"{label}: when-clause on binding '{field_name}' "
-                            f"references '{slug}' which is not in depends_on"
-                        )
-
+        evaluation_steps = binding_evaluation_steps(node)
+        if evaluation_steps > MAX_NODE_BINDING_EVALUATIONS:
+            return (
+                f"{label}: bindings require {evaluation_steps} evaluations; "
+                f"maximum is {MAX_NODE_BINDING_EVALUATIONS}"
+            )
     return None

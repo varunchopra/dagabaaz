@@ -1,4 +1,4 @@
-"""Centralized domain constants for the DAG execution engine."""
+"""Enums and limits used by the execution model."""
 
 from enum import StrEnum
 
@@ -15,17 +15,9 @@ class RunStatus(StrEnum):
 
 
 class TaskStatus(StrEnum):
-    """Lifecycle states for a single task within a run.
+    """Lifecycle states for task attempts.
 
-    SKIPPED vs FILTERED: both are terminal non-execution states, but they
-    have different cascade semantics. SKIPPED cascades — if a node is
-    skipped, all downstream nodes are also skipped (upstream is dead).
-    FILTERED does NOT cascade — the node had no artifacts (edge filter
-    rejected all, or BFS stopped at a non-passthrough upstream). Downstream
-    nodes still attempt artifact collection. Whether they succeed depends
-    on the ``passthrough`` flag on upstream plugins: BFS walks through
-    passthrough nodes (Gate) to reach earlier ancestors, but stops at
-    non-passthrough nodes (processors).
+    Node outcomes such as skipped or filtered belong to ``NodeDisposition``.
     """
 
     PENDING = "pending"
@@ -35,20 +27,58 @@ class TaskStatus(StrEnum):
     FAILED = "failed"
     CRASHED = "crashed"
     CANCELLED = "cancelled"
+
+
+class NodeDisposition(StrEnum):
+    """The outcome of planning and launching one node.
+
+    A required edge whose source was skipped gives the consumer a ``SKIPPED``
+    disposition. A filtered source supplies an empty edge, after which the
+    consumer's required-edge rules determine its disposition.
+    """
+
+    LAUNCHED = "launched"
     SKIPPED = "skipped"
     FILTERED = "filtered"
+    FAILED = "failed"
 
 
-class NodeSummaryStatus(StrEnum):
-    """Per-node aggregate status for skip cascade decisions."""
+class InputMode(StrEnum):
+    """How selected main-edge outputs become task plans.
 
-    COMPLETED = "completed"
-    SKIPPED = "skipped"
-    PARTIAL = "partial"
+    ``EACH`` creates one plan per output. ``ALL`` creates one plan containing
+    every selected output. ``BY_CORRELATION`` creates one plan per retained
+    correlation ID.
+    """
+
+    EACH = "each"
+    ALL = "all"
+    BY_CORRELATION = "by_correlation"
+
+
+class InputRole(StrEnum):
+    """Whether an edge participates in input-mode grouping or supplies a side input."""
+
+    MAIN = "main"
+    SIDE = "side"
+
+
+class CorrelationMode(StrEnum):
+    """How emitted outputs receive correlation IDs.
+
+    ``DEFAULT`` is resolved from whether the node is a root and from its input
+    mode. ``INHERIT`` copies the task plan's correlation ID, ``NEW`` uses the
+    emitted output's ID and ``NONE`` leaves the output uncorrelated.
+    """
+
+    DEFAULT = "default"
+    INHERIT = "inherit"
+    NEW = "new"
+    NONE = "none"
 
 
 class FilterOperator(StrEnum):
-    """Predicate operators for edge filter rules."""
+    """Predicate operators for routing fields."""
 
     EQ = "eq"
     NEQ = "neq"
@@ -66,90 +96,63 @@ class FilterOperator(StrEnum):
     NOT_EXISTS = "not_exists"
 
 
-class FileType(StrEnum):
-    """Virtual file type classification for artifact filtering."""
+class SortOrder(StrEnum):
+    """Ordering used by edge selection."""
 
-    VIDEO = "video"
-    SUBTITLE = "subtitle"
-    IMAGE = "image"
-    AUDIO = "audio"
-    ARCHIVE = "archive"
-    OTHER = "other"
+    ASC = "asc"
+    DESC = "desc"
 
 
-class ArtifactSelector(StrEnum):
-    """Post-filter reduction strategies for edge filters."""
+class LaunchCreateStatus(StrEnum):
+    """The outcome of an attempted node-launch creation.
 
-    LARGEST = "largest"
-    SMALLEST = "smallest"
-
-
-class FanMode(StrEnum):
-    """How a node aggregates upstream artifacts into tasks.
-
-    A boolean fan_in couldn't express scatter-gather correlation — the
-    pattern where N items fan out to M parallel branches and a downstream
-    node must receive N groups of M correlated results.
-
-    SINGLE:    One task per artifact (fan-out). The default.
-    AGGREGATE: One task receiving ALL upstream artifacts.
-    GROUPED:   One task per origin group. For scatter-gather correlation —
-               10 items x 3 branches -> 10 tasks, each receiving 3 results.
+    ``CREATED`` identifies a newly written launch, ``ALREADY_EXISTS`` identifies
+    a launch for the same generation, and ``STALE`` means that the snapshot no
+    longer represents the active source state.
     """
 
-    SINGLE = "single"
-    AGGREGATE = "aggregate"
-    GROUPED = "grouped"
-
-
-class BindingSource(StrEnum):
-    """Where a binding gets its value from."""
-
-    PREVIOUS_NODE = "previous_node"
-    CONFIG = "config"
-    RUNTIME = "runtime"
-    EXPRESSION = "expression"
+    CREATED = "created"
+    ALREADY_EXISTS = "already_exists"
+    STALE = "stale"
 
 
 RUN_TERMINAL_STATUSES = frozenset(
     {RunStatus.COMPLETED, RunStatus.FAILED, RunStatus.CRASHED, RunStatus.CANCELLED}
 )
-"""Run statuses where no further state transitions are allowed."""
-
 TASK_TERMINAL_STATUSES = frozenset(
-    {
-        TaskStatus.COMPLETED,
-        TaskStatus.FAILED,
-        TaskStatus.CRASHED,
-        TaskStatus.CANCELLED,
-        TaskStatus.SKIPPED,
-        TaskStatus.FILTERED,
-    }
+    {TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CRASHED, TaskStatus.CANCELLED}
 )
-"""Task statuses where no further state transitions are allowed."""
-
 RUN_RETRYABLE_STATUSES = RUN_TERMINAL_STATUSES - {RunStatus.COMPLETED}
-"""Terminal run statuses that can be retried."""
 
-TASK_RETRYABLE_STATUSES = TASK_TERMINAL_STATUSES - {
-    TaskStatus.COMPLETED,
-    TaskStatus.SKIPPED,
-}
-"""Terminal task statuses that warrant retry."""
-
-ARTIFACT_STANDARD_FIELDS = frozenset(
-    {"file_path", "file_name", "file_size", "mime_type"}
-)
-"""Fields resolved directly from artifact attributes, not metadata.
-
-Note: ``file_path`` is only present on ``TaskArtifact`` (worker-side),
-not ``DagArtifact`` (orchestrator-side). ``extract_artifact_field``
-handles the absence gracefully via getattr with debug logging.
-"""
-
-MAX_FAN_OUT = 200
-"""Fan-out guard: fail loudly rather than silently truncating results.
-Airflow caps at 1024; 200 is generous for our use case."""
-
-MAX_BFS_DEPTH = 50
-"""BFS depth cap for dependency traversal — detects cycles."""
+# These limits bound memory, storage and queueing at execution boundaries.
+MAX_OUTPUT_FIELDS_BYTES = 64 * 1024
+MAX_JSON_DEPTH = 16
+MAX_JSON_KEYS = 512
+MAX_JSON_VALUES = 10_000
+MAX_INPUT_EDGES_PER_NODE = 64
+MAX_NODE_BINDINGS = 64
+MAX_NODE_BINDING_EVALUATIONS = 64
+MAX_LAUNCH_BINDING_EVALUATIONS = 10_000
+MAX_LAUNCH_BINDING_EVALUATED_BYTES = 16 * 1024 * 1024
+MAX_FILTER_RULES_PER_EDGE = 64
+MAX_FILTER_MEMBERSHIP_VALUES = 256
+MAX_OUTPUT_ID_LENGTH = 512
+# Snapshot readers return at most each limit plus one output. The extra output
+# only proves that planning must reject the snapshot.
+MAX_SNAPSHOT_OUTPUTS_PER_EDGE = 10_000
+MAX_SNAPSHOT_OUTPUTS_PER_NODE = 50_000
+MAX_SNAPSHOT_ROUTING_BYTES = 16 * 1024 * 1024
+# A first task publication above either limit fails before output persistence.
+MAX_OUTPUTS_PER_TASK_COMPLETION = MAX_SNAPSHOT_OUTPUTS_PER_NODE
+MAX_TASK_COMPLETION_ROUTING_BYTES = MAX_SNAPSHOT_ROUTING_BYTES
+MAX_TASK_PLANS_PER_LAUNCH = 200
+MAX_OUTPUT_REFS_PER_PLAN = 5_000
+MAX_TASK_PLAN_BYTES = 512 * 1024
+# Root plans include the run input and the plan envelope.
+MAX_RUN_INPUT_BYTES = MAX_TASK_PLAN_BYTES // 2
+MAX_EXPRESSION_LENGTH = 16_384
+MAX_EXPRESSION_RESULT_BYTES = MAX_TASK_PLAN_BYTES
+MAX_EXPRESSION_EVALUATION_STEPS = 64
+MAX_PIPE_ARGUMENT_LENGTH = 4_096
+MAX_PIPE_INTEGER_DIGITS = 4_096
+MAX_SNAPSHOT_RETRIES = 3

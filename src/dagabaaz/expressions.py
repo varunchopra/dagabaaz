@@ -1,25 +1,36 @@
-"""Expression evaluation engine for ``{namespace.key | pipe}`` bindings.
+"""Parsing, validation and evaluation for task-parameter expressions.
 
-Three layers, each callable independently:
-
-  tokenize_expression() -- string -> token list (parsing)
-  resolve_expression()  -- tokens + lookup -> value (evaluation)
-  validate_expression() -- tokens -> error string (static analysis)
-
-Supports function calls: ``{list(ns1.key, ns2.key)}`` produces a list
-from multiple variable references. Functions are pre-pipe (the result
-flows into the pipe chain): ``{list(a.url, b.url) | join(,)}``.
+Expressions may contain text, references such as ``{edge.field}``, function
+calls and pipes. Expression evaluation uses ordinary Python dictionaries and
+lists. Persisted models freeze the result after evaluation.
 """
 
 import functools
 import inspect
 import re
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from typing import Literal
 
+from dagabaaz.constants import (
+    MAX_EXPRESSION_EVALUATION_STEPS,
+    MAX_EXPRESSION_LENGTH,
+    MAX_EXPRESSION_RESULT_BYTES,
+    MAX_PIPE_ARGUMENT_LENGTH,
+)
+from dagabaaz.json import (
+    JsonValue,
+    JsonWireValue,
+    bounded_json_size,
+    freeze_json,
+    thaw_json,
+)
 from dagabaaz.models import ExpressionError
-from dagabaaz.pipes import BUILTIN_PIPES, PIPE_ARITY
+from dagabaaz.pipes import (
+    BUILTIN_PIPES,
+    PIPE_ARITY,
+    _bounded_text_join,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -30,7 +41,7 @@ class PipeCall:
 
 @dataclass(frozen=True, slots=True)
 class PipeSpec:
-    """Argument names exclude the implicit piped value."""
+    """``argument_names`` lists arguments supplied after the piped value."""
 
     name: str
     min_args: int
@@ -47,20 +58,67 @@ class ExpressionVocabulary:
 @dataclass(frozen=True, slots=True)
 class Token:
     kind: Literal["text", "ref", "call"]
-    value: str  # literal text, "namespace.key", or function name
+    value: str  # Literal text, a reference or a function name.
     pipes: tuple[PipeCall, ...]
-    refs: tuple[str, ...] = ()  # argument refs for "call" tokens
+    refs: tuple[str, ...] = ()  # Function argument references.
 
 
 Lookup = Callable[[str, str], object | None]
 
-# Detects function call syntax: valid identifier followed by opening paren.
-# Must match before _parse_ref_body runs — function calls don't contain a
-# dot at the top level, so they'd fail the "namespace.key" validation.
+
+@dataclass(slots=True)
+class EvaluationBudget:
+    """Cumulative JSON bytes processed while resolving one node launch."""
+
+    limit: int
+    used: int = 0
+
+    def __post_init__(self) -> None:
+        if type(self.limit) is not int or self.limit < 0:
+            raise ValueError("evaluation byte limit must be a non-negative integer")
+        if type(self.used) is not int or self.used < 0 or self.used > self.limit:
+            raise ValueError("used evaluation bytes must be within the limit")
+
+    def charge_size(self, size: int) -> None:
+        if type(size) is not int or size < 0:
+            raise ValueError("evaluation size must be a non-negative integer")
+        if size > self.limit - self.used:
+            raise ExpressionError(f"binding evaluation exceeds the {self.limit}-byte launch limit")
+        self.used += size
+
+    def charge(self, value: JsonValue | JsonWireValue) -> None:
+        self.charge_size(_ensure_result_size(value))
+
+
+# Function calls are recognised before references because a call has no
+# top-level namespace separator.
 _FUNC_CALL_RE = re.compile(r"^([a-zA-Z_]\w*)\(")
 
-_FUNCTION_DISPATCH: dict[str, Callable[[Token, Lookup], object]] = {
-    "list": lambda token, lookup: [lookup(*_split_ref(ref)) for ref in token.refs],
+
+def _list_function(
+    token: Token,
+    lookup: Lookup,
+    budget: EvaluationBudget | None,
+) -> object:
+    """References are added only while the encoded array remains within bounds."""
+
+    result: list[JsonWireValue] = []
+    size = 2
+    for ref in token.refs:
+        value = _resolve_reference(ref, lookup, budget)
+        item_size = _result_size(value)
+        candidate = size + item_size + (1 if result else 0)
+        _check_result_size(candidate)
+        result.append(value)
+        size = candidate
+    return result
+
+
+_FUNCTION_DISPATCH: dict[
+    str,
+    Callable[[Token, Lookup, EvaluationBudget | None], object],
+] = {
+    "list": _list_function,
 }
 
 _KNOWN_FUNCTIONS = frozenset(_FUNCTION_DISPATCH.keys())
@@ -78,22 +136,30 @@ def get_expression_vocabulary() -> ExpressionVocabulary:
                 argument_names=tuple(inspect.signature(pipe).parameters)[1:],
             )
         )
-    return ExpressionVocabulary(
-        pipes=tuple(pipe_specs), functions=tuple(sorted(_KNOWN_FUNCTIONS))
+    return ExpressionVocabulary(pipes=tuple(pipe_specs), functions=tuple(sorted(_KNOWN_FUNCTIONS)))
+
+
+def _token_evaluation_steps(tokens: tuple[Token, ...]) -> int:
+    return sum(
+        len(token.pipes)
+        + (1 if token.kind == "ref" else len(token.refs) if token.kind == "call" else 0)
+        for token in tokens
     )
 
 
 @functools.lru_cache(maxsize=256)
 def tokenize_expression(expression: str) -> tuple[Token, ...]:
-    """Parse an expression string into tokens.
+    """The expression is parsed into immutable tokens.
 
-    Walks left to right, switching between TEXT and REF modes on ``{``/``}``.
-    Raises ExpressionError on malformed input (unclosed braces, empty refs).
-
-    Cached because resolve_expression re-tokenizes on every call — strings
-    are hashable and the return is an immutable tuple of frozen dataclasses,
-    so cached values cannot be corrupted by callers.
+    Malformed braces, references, calls and pipes raise ``ExpressionError``.
+    Results are cached because one expression may be evaluated for several
+    plans and ``Token`` is immutable.
     """
+    if len(expression) > MAX_EXPRESSION_LENGTH:
+        raise ExpressionError(
+            f"expression is {len(expression)} characters; maximum is {MAX_EXPRESSION_LENGTH}"
+        )
+
     tokens: list[Token] = []
     pos = 0
     length = len(expression)
@@ -115,18 +181,15 @@ def tokenize_expression(expression: str) -> tuple[Token, ...]:
             scan = pos + 1
             while scan < length:
                 if expression[scan] == "{":
-                    # Nested expressions are not supported — _parse_ref_body
-                    # treats the body as flat text, so nested braces would
-                    # silently misparse rather than fail.
-                    raise ExpressionError(
-                        f"Nested braces not supported at position {scan}"
-                    )
+                    # A second opening brace would otherwise become text inside
+                    # a flat reference.
+                    raise ExpressionError(f"nested braces are not supported at position {scan}")
                 if expression[scan] == "}":
                     scan += 1
                     break
                 scan += 1
             else:
-                # Reached end of string without finding closing brace
+                # The closing brace was not found before the end of the expression.
                 msg = f"Unclosed '{{' at position {pos}"
                 raise ExpressionError(msg)
 
@@ -135,9 +198,6 @@ def tokenize_expression(expression: str) -> tuple[Token, ...]:
                 msg = f"Empty reference '{{}}' at position {pos}"
                 raise ExpressionError(msg)
 
-            # Function call detection: must happen BEFORE _parse_ref_body
-            # because function calls like "list(a.url, b.url)" don't have a
-            # top-level dot and would fail the namespace.key validation.
             func_match = _FUNC_CALL_RE.match(ref_body)
             if func_match:
                 token = _parse_func_call(ref_body, pos)
@@ -158,13 +218,26 @@ def tokenize_expression(expression: str) -> tuple[Token, ...]:
     if buf:
         tokens.append(Token(kind="text", value="".join(buf), pipes=()))
 
-    return tuple(tokens)
+    result = tuple(tokens)
+    evaluation_steps = _token_evaluation_steps(result)
+    if evaluation_steps > MAX_EXPRESSION_EVALUATION_STEPS:
+        raise ExpressionError(
+            f"expression requires {evaluation_steps} reference and pipe evaluations; "
+            f"maximum is {MAX_EXPRESSION_EVALUATION_STEPS}"
+        )
+    return result
+
+
+def expression_evaluation_steps(expression: str) -> int:
+    """Return the bounded number of reference lookups and pipe calls."""
+
+    return _token_evaluation_steps(tokenize_expression(expression))
 
 
 def _split_on_pipes(body: str, pos: int) -> list[str]:
-    """Split a body string on ``|`` at paren depth 0.
+    """Pipe separators at parenthesis depth zero divide the body.
 
-    Shared by _parse_ref_body (ref | pipes) and _parse_func_call (func(...) | pipes).
+    Reference and function-call parsers use the same rule.
     """
     parts: list[str] = []
     current: list[str] = []
@@ -189,7 +262,7 @@ def _split_on_pipes(body: str, pos: int) -> list[str]:
 
 
 def _parse_pipe_chain(raw_parts: list[str], pos: int) -> list[PipeCall]:
-    """Parse a list of raw pipe strings into PipeCall objects."""
+    """Each raw pipe string becomes a ``PipeCall``."""
     pipes: list[PipeCall] = []
     for raw_pipe in raw_parts:
         if not raw_pipe:
@@ -199,32 +272,30 @@ def _parse_pipe_chain(raw_parts: list[str], pos: int) -> list[PipeCall]:
 
 
 def _parse_ref_body(body: str, pos: int) -> tuple[str, list[PipeCall]]:
-    """Parse ``namespace.key | pipe1 | pipe2(arg)`` into ref + pipe list."""
+    """Reference parsing preserves the ordered pipe calls."""
     parts = _split_on_pipes(body, pos)
 
     ref = parts[0]
     if not ref:
         msg = f"Empty reference at position {pos}"
         raise ExpressionError(msg)
-    if "." not in ref:
-        msg = f"Invalid reference '{ref}' at position {pos}: expected 'namespace.key'"
-        raise ExpressionError(msg)
+    _validate_ref(ref, pos)
 
     return ref, _parse_pipe_chain(parts[1:], pos)
 
 
 def _parse_func_call(body: str, pos: int) -> Token:
-    """Parse ``list(ns1.key, ns2.key) | pipe1 | pipe2`` into a call Token.
+    """Function-call parsing yields a token with optional pipes.
 
-    Depth-tracked scan finds the matching ``)`` for the opening ``(``,
-    then splits the remainder on ``|`` for the pipe chain.  Arguments
-    are ``namespace.key`` refs only (v1 — no nested expressions).
+    Parenthesis depth identifies the end of the outer call when a later pipe
+    also has arguments. Arguments are ``namespace.key`` references; nested
+    function calls are not supported.
     """
     paren_start = body.index("(")
     func_name = body[:paren_start].strip()
 
-    # Depth-tracked scan to find matching closing paren.
-    # Critically, this finds list()'s ) — NOT join(,)'s ).
+    # The matching parenthesis belongs to the outer function call; later pipe
+    # calls may contain their own parentheses.
     depth = 1
     scan = paren_start + 1
     while scan < len(body):
@@ -236,22 +307,23 @@ def _parse_func_call(body: str, pos: int) -> Token:
                 break
         scan += 1
     else:
-        raise ExpressionError(
-            f"Unclosed '(' in function '{func_name}' at position {pos}"
-        )
+        raise ExpressionError(f"Unclosed '(' in function '{func_name}' at position {pos}")
 
-    # Everything inside the matched parens = comma-separated refs.
+    # Arguments inside the outer parentheses are comma-separated references.
     args_str = body[paren_start + 1 : scan]
     refs: list[str] = [arg.strip() for arg in args_str.split(",") if arg.strip()]
+    if len(refs) > MAX_EXPRESSION_EVALUATION_STEPS:
+        raise ExpressionError(
+            f"function {func_name!r} has {len(refs)} references; "
+            f"maximum is {MAX_EXPRESSION_EVALUATION_STEPS}"
+        )
 
     for ref in refs:
-        if "." not in ref:
-            msg = (
-                f"Invalid reference '{ref}' at position {pos}: expected 'namespace.key'"
-            )
-            raise ExpressionError(msg)
+        if "(" in ref or ")" in ref:
+            raise ExpressionError(f"Nested function calls are not supported at position {pos}")
+        _validate_ref(ref, pos)
 
-    # Everything after the matched ) = pipe chain.
+    # Text after the outer parentheses forms the pipe chain.
     remainder = body[scan + 1 :].strip()
     pipes: list[PipeCall] = []
     if remainder:
@@ -269,7 +341,7 @@ def _parse_func_call(body: str, pos: int) -> Token:
 
 
 def _split_pipe_args(args_str: str) -> tuple[str, ...]:
-    """Split pipe argument string on commas, supporting backslash-escaped commas.
+    """Commas divide pipe arguments, and a backslash escapes a comma.
 
     A literal comma in a pipe argument can be written as ``\\,``.
     For example: ``replace(foo\\,bar,baz)`` passes ``"foo,bar"`` and ``"baz"``.
@@ -294,8 +366,24 @@ def _split_pipe_args(args_str: str) -> tuple[str, ...]:
     return tuple(args)
 
 
+def _validate_ref(ref: str, pos: int) -> None:
+    """A reference contains a non-empty namespace and key."""
+
+    dot = ref.find(".")
+    if dot == -1:
+        raise ExpressionError(
+            f"Invalid reference '{ref}' at position {pos}: expected 'namespace.key'"
+        )
+    if dot == 0:
+        raise ExpressionError(
+            f"Invalid reference '{ref}' at position {pos}: namespace cannot be empty"
+        )
+    if dot == len(ref) - 1:
+        raise ExpressionError(f"Invalid reference '{ref}' at position {pos}: key cannot be empty")
+
+
 def _parse_pipe_call(raw: str, pos: int) -> PipeCall:
-    """Parse ``name`` or ``name(arg1,arg2)`` into a PipeCall."""
+    """Pipe syntax produces a call for ``name`` or ``name(arg1,arg2)``."""
     paren_idx = raw.find("(")
     if paren_idx == -1:
         return PipeCall(name=raw.strip(), args=())
@@ -307,91 +395,145 @@ def _parse_pipe_call(raw: str, pos: int) -> PipeCall:
 
     args_str = raw[paren_idx + 1 : -1]
     args = _split_pipe_args(args_str)
+    for argument in args:
+        if len(argument) > MAX_PIPE_ARGUMENT_LENGTH:
+            raise ExpressionError(
+                f"pipe {name!r} argument is {len(argument)} characters; "
+                f"maximum is {MAX_PIPE_ARGUMENT_LENGTH}"
+            )
     return PipeCall(name=name, args=args)
 
 
-def resolve_expression(expression: str, lookup: Lookup) -> object | None:
-    """Evaluate an expression string to a value.
+def resolve_expression(
+    expression: str,
+    lookup: Lookup,
+    *,
+    budget: EvaluationBudget | None = None,
+) -> JsonWireValue:
+    """The lookup supplies values for expression evaluation.
 
-    ``lookup(namespace, key)`` provides variable resolution — the expression
-    engine knows nothing about artifacts, slugs, or configs.
-
-    Resolution rules:
-      1. Single ref/call, no pipes → native type (preserves lists, numbers)
-      2. Single ref/call with pipes → pipe chain result
-      3. Multiple tokens / mixed text → string interpolation
-      4. Missing ref → None (no pipes) or "" (with pipes)
+    A single reference or call returns its routing value, including the result
+    of any pipes. When the expression also contains text, resolved values are
+    interpolated into a string. A missing standalone reference returns
+    ``None``; before a pipe or within text it becomes an empty string.
     """
     tokens = tokenize_expression(expression)
     if not tokens:
         return None
 
-    # Rule 1 & 2: single token preserves native type.
+    # A single reference or call preserves its routing value.
     if len(tokens) == 1 and tokens[0].kind in ("ref", "call"):
         token = tokens[0]
-        value: object
+        value: JsonWireValue
         if token.kind == "ref":
-            namespace, key = _split_ref(token.value)
-            value = lookup(namespace, key)
+            value = _resolve_reference(token.value, lookup, budget)
         else:
-            value = _resolve_call(token, lookup)
+            value = _resolve_call(token, lookup, budget)
         if token.pipes:
-            return _apply_pipes(value, token.pipes)
+            return _apply_pipes(value, token.pipes, budget)
         return value
 
-    # Rule 3: multiple tokens → string interpolation.
-    parts: list[str] = []
-    for token in tokens:
-        if token.kind == "text":
-            parts.append(token.value)
-        elif token.kind == "ref":
-            namespace, key = _split_ref(token.value)
-            value = lookup(namespace, key)
-            if token.pipes:
-                value = _apply_pipes(value, token.pipes)
-            parts.append(str(value) if value is not None else "")
-        elif token.kind == "call":
-            value = _resolve_call(token, lookup)
-            if token.pipes:
-                value = _apply_pipes(value, token.pipes)
-            # In interpolation context, render lists as comma-joined with
-            # Nones filtered. Standalone {list(...)} preserves Nones for
-            # positional correspondence; embedded in text, Nones are
-            # confusing so we drop them.
-            if isinstance(value, list):
-                parts.append(", ".join(str(v) for v in value if v is not None))
-            else:
-                parts.append(str(value) if value is not None else "")
-
-    result = "".join(parts)
+    result = _bounded_text_join(_interpolation_parts(tokens, lookup, budget))
+    if budget is not None:
+        budget.charge(result)
     return result if result else None
 
 
-def _resolve_call(token: Token, lookup: Lookup) -> object:
-    """Resolve a function call token to its value."""
+def _interpolation_parts(
+    tokens: tuple[Token, ...],
+    lookup: Lookup,
+    budget: EvaluationBudget | None,
+) -> Iterator[str]:
+    """Resolve interpolation in order so the size guard can stop evaluation."""
+
+    for token in tokens:
+        if token.kind == "text":
+            yield token.value
+        elif token.kind == "ref":
+            value = _resolve_reference(token.value, lookup, budget)
+            if token.pipes:
+                value = _apply_pipes(value, token.pipes, budget)
+            yield _interpolate(value)
+        elif token.kind == "call":
+            value = _resolve_call(token, lookup, budget)
+            if token.pipes:
+                value = _apply_pipes(value, token.pipes, budget)
+            yield _interpolate(value)
+
+
+def _resolve_call(
+    token: Token,
+    lookup: Lookup,
+    budget: EvaluationBudget | None,
+) -> JsonWireValue:
+    """Registered functions return JSON values in ordinary Python containers."""
     handler = _FUNCTION_DISPATCH.get(token.value)
     if handler is None:
         raise ExpressionError(f"Unknown function '{token.value}'")
-    return handler(token, lookup)
+    value = handler(token, lookup, budget)
+    try:
+        result = thaw_json(freeze_json(value))
+    except ValueError as exc:
+        raise ExpressionError(f"function {token.value!r} returned a non-JSON value: {exc}") from exc
+    size = _ensure_result_size(result)
+    if budget is not None:
+        budget.charge_size(size)
+    return result
+
+
+def _resolve_reference(
+    ref: str,
+    lookup: Lookup,
+    budget: EvaluationBudget | None,
+) -> JsonWireValue:
+    """Lookup values are copied and validated as ordinary JSON values."""
+
+    namespace, key = _split_ref(ref)
+    try:
+        result = thaw_json(freeze_json(lookup(namespace, key)))
+    except ValueError as exc:
+        raise ExpressionError(f"reference {ref!r} is not JSON-compatible: {exc}") from exc
+    size = _ensure_result_size(result)
+    if budget is not None:
+        budget.charge_size(size)
+    return result
+
+
+def _interpolate(value: JsonWireValue) -> str:
+    """Values embedded in text use their string representation.
+
+    Arrays are comma-separated and omit null members.
+    """
+
+    if value is None:
+        return ""
+    if isinstance(value, list):
+        return _bounded_text_join((str(item) for item in value if item is not None), ", ")
+    return str(value)
 
 
 def _split_ref(ref: str) -> tuple[str, str]:
-    """Split ``namespace.key`` into ``(namespace, key)``."""
+    """The first dot separates ``namespace`` from ``key``."""
     dot = ref.find(".")
     if dot == -1:
         raise ExpressionError(f"Invalid reference '{ref}': expected 'namespace.key'")
+    if dot == 0:
+        raise ExpressionError(f"Invalid reference '{ref}': namespace cannot be empty")
     key = ref[dot + 1 :]
     if not key:
         raise ExpressionError(f"Invalid reference '{ref}': key cannot be empty")
     return ref[:dot], key
 
 
-def _apply_pipes(value: object, pipes: tuple[PipeCall, ...]) -> object:
-    """Apply a chain of pipe functions to a value.
+def _apply_pipes(
+    value: JsonWireValue,
+    pipes: tuple[PipeCall, ...],
+    budget: EvaluationBudget | None,
+) -> JsonWireValue:
+    """Pipe calls run in order.
 
-    None is converted to empty string before each pipe so string operations
-    don't produce ``"None"``. The ``default`` pipe relies on this: empty
-    string is falsy, triggering the fallback.
+    A missing value becomes an empty string before the next call, which also
+    allows the ``default`` pipe to select its fallback.
     """
     for pipe_call in pipes:
         fn = BUILTIN_PIPES.get(pipe_call.name)
@@ -401,18 +543,46 @@ def _apply_pipes(value: object, pipes: tuple[PipeCall, ...]) -> object:
         if value is None:
             value = ""
         try:
-            value = fn(value, *pipe_call.args)
+            pipe_result = fn(value, *pipe_call.args)
         except TypeError as exc:
             msg = f"Pipe '{pipe_call.name}' called with {len(pipe_call.args)} arg(s): {exc}"
             raise ExpressionError(msg) from exc
+        try:
+            value = thaw_json(freeze_json(pipe_result))
+        except ValueError as exc:
+            raise ExpressionError(
+                f"pipe {pipe_call.name!r} returned a non-JSON value: {exc}"
+            ) from exc
+        size = _ensure_result_size(value)
+        if budget is not None:
+            budget.charge_size(size)
     return value
 
 
-RESERVED_NAMESPACES = frozenset({"input", "config"})
+def _result_size(value: JsonValue | JsonWireValue) -> int:
+    """Return the exact JSON size, stopping once the result exceeds its budget."""
+
+    try:
+        return bounded_json_size(value, MAX_EXPRESSION_RESULT_BYTES)
+    except ValueError as exc:
+        raise ExpressionError(f"expression result is not valid JSON: {exc}") from exc
+
+
+def _check_result_size(size: int) -> None:
+    if size > MAX_EXPRESSION_RESULT_BYTES:
+        raise ExpressionError(
+            f"expression result exceeds maximum size {MAX_EXPRESSION_RESULT_BYTES} bytes"
+        )
+
+
+def _ensure_result_size(value: JsonValue | JsonWireValue) -> int:
+    size = _result_size(value)
+    _check_result_size(size)
+    return size
 
 
 def validate_expression(expression: str) -> str | None:
-    """Check expression syntax. Returns error message or None on success."""
+    """Valid syntax yields ``None``; invalid syntax yields an error message."""
     try:
         tokens = tokenize_expression(expression)
     except ExpressionError as exc:
@@ -421,11 +591,10 @@ def validate_expression(expression: str) -> str | None:
     for token in tokens:
         if token.kind == "text":
             continue
-        # Validate pipes on both ref and call tokens.
         for pipe_call in token.pipes:
             if pipe_call.name not in BUILTIN_PIPES:
                 return f"Unknown pipe '{pipe_call.name}'"
-            # Arity validation — reject wrong argument count at save time.
+            # Pipe arity can be checked without evaluating the expression.
             arity = PIPE_ARITY.get(pipe_call.name)
             if arity is not None:
                 min_args, max_args = arity
@@ -439,23 +608,21 @@ def validate_expression(expression: str) -> str | None:
 
 
 def extract_refs(expression: str) -> tuple[set[str], set[str]]:
-    """Extract node slugs and runtime input keys from an expression.
+    """Reference extraction returns edge names and run-input keys.
 
-    Returns ``(node_slugs, runtime_keys)``. Handles both ``ref`` tokens
-    (single variable) and ``call`` tokens (function arguments).
-    Raises ``ExpressionError`` on syntax errors.
+    Invalid syntax raises ``ExpressionError``.
     """
     tokens = tokenize_expression(expression)
 
-    slugs: set[str] = set()
+    edge_names: set[str] = set()
     runtime_keys: set[str] = set()
 
     def _collect_ref(ref: str) -> None:
         namespace, key = _split_ref(ref)
         if namespace == "input":
             runtime_keys.add(key)
-        elif namespace != "config":
-            slugs.add(namespace)
+        else:
+            edge_names.add(namespace)
 
     for token in tokens:
         if token.kind == "ref":
@@ -464,4 +631,4 @@ def extract_refs(expression: str) -> tuple[set[str], set[str]]:
             for ref in token.refs:
                 _collect_ref(ref)
 
-    return slugs, runtime_keys
+    return edge_names, runtime_keys

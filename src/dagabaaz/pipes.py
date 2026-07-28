@@ -1,20 +1,20 @@
-"""Built-in pipe functions for the expression engine.
+"""Built-in pipe functions for task-parameter expressions.
 
-Pure transforms that operate on scalar or list values. Each pipe receives
-the current value as its first argument, plus optional string arguments
-from the expression syntax: ``{slug.key | pipe(arg1, arg2)}``.
-
-Growth area — new pipes are added here with one function + one dict entry
-+ one arity entry. No registration decorator, no mutable state.
+Each pipe receives the current value followed by optional string arguments,
+as in ``{edge.key | replace(old,new)}``. Registration requires matching
+entries in ``BUILTIN_PIPES`` and ``PIPE_ARITY``.
+Pipe inputs and results use ordinary Python dictionaries and lists.
 """
 
 import json
-import math
 import types
-from collections.abc import Callable
+from collections.abc import Callable, Iterable, Mapping
+from decimal import Decimal, InvalidOperation
 from pathlib import PurePosixPath
-from typing import Final
+from typing import Final, cast
 from urllib.parse import quote, unquote
+
+from dagabaaz.constants import MAX_EXPRESSION_RESULT_BYTES, MAX_PIPE_INTEGER_DIGITS
 
 try:
     import re2 as _re_engine
@@ -23,45 +23,122 @@ except ImportError:
     import warnings
 
     warnings.warn(
-        "google-re2 not installed, falling back to stdlib re. "
-        "User-supplied regex patterns will not have ReDoS protection. "
-        "Install with: pip install google-re2",
+        "google-re2 is not installed; regular expressions will use Python's "
+        "re module without ReDoS protection. Install Dagabaaz with the re2 "
+        "extra to enable protected matching.",
         stacklevel=2,
     )
 
+from dagabaaz.json import (
+    JsonValue,
+    JsonWireValue,
+    json_string_payload_size,
+    routing_text,
+    thaw_json,
+)
 from dagabaaz.models import ExpressionError
 
 
+def _text(value: object) -> str:
+    return routing_text(cast(JsonValue | JsonWireValue, value))
+
+
+def _json_string_payload_size(value: str, *, limit: int | None = None) -> int:
+    """Return the UTF-8 JSON byte count excluding the surrounding quotes."""
+
+    try:
+        return json_string_payload_size(value, limit=limit)
+    except ValueError as exc:
+        raise ExpressionError("expression text is not valid UTF-8") from exc
+
+
+def _check_text_result_size(payload_size: int) -> None:
+    size = payload_size + 2
+    if size > MAX_EXPRESSION_RESULT_BYTES:
+        raise ExpressionError(
+            f"expression result would be {size} bytes; maximum is {MAX_EXPRESSION_RESULT_BYTES}"
+        )
+
+
+def _materialise_join(separator: str, parts: list[str]) -> str:
+    return separator.join(parts)
+
+
+def _materialise_replace(text: str, old: str, new: str) -> str:
+    return text.replace(old, new)
+
+
+def _bounded_text_join(parts: Iterable[str], separator: str = "") -> str:
+    """Check the encoded result before joining its parts."""
+
+    collected: list[str] = []
+    payload_size = 0
+    separator_size = _json_string_payload_size(separator)
+    for part in parts:
+        candidate = payload_size + _json_string_payload_size(part)
+        if collected:
+            candidate += separator_size
+        _check_text_result_size(candidate)
+        collected.append(part)
+        payload_size = candidate
+    return _materialise_join(separator, collected)
+
+
+def _decimal(value: object) -> Decimal | None:
+    if isinstance(value, bool):
+        return None
+    try:
+        number = Decimal(_text(value))
+    except (InvalidOperation, TypeError, ValueError):
+        return None
+    return number if number.is_finite() else None
+
+
+def _integer(number: Decimal) -> int | None:
+    if number.adjusted() >= MAX_PIPE_INTEGER_DIGITS:
+        return None
+    return int(number)
+
+
 def _upper(value: object) -> object:
-    return str(value).upper()
+    return _text(value).upper()
 
 
 def _lower(value: object) -> object:
-    return str(value).lower()
+    return _text(value).lower()
 
 
 def _trim(value: object) -> object:
-    return str(value).strip()
+    return _text(value).strip()
 
 
 def _title(value: object) -> object:
-    return str(value).title()
+    return _text(value).title()
 
 
 def _replace(value: object, old: str, new: str = "") -> object:
-    return str(value).replace(old, new)
+    text = _text(value)
+    replacements = len(text) + 1 if old == "" else text.count(old)
+    # The encoded size is additive, so the guard does not build the replacement.
+    output_size = _json_string_payload_size(text)
+    if replacements:
+        output_size += replacements * (
+            _json_string_payload_size(new) - _json_string_payload_size(old)
+        )
+    _check_text_result_size(output_size)
+    return _materialise_replace(text, old, new)
 
 
 def _strip(value: object, chars: str = "") -> object:
-    return str(value).strip(chars) if chars else str(value).strip()
+    return _text(value).strip(chars) if chars else _text(value).strip()
 
 
 def _lstrip(value: object, chars: str = "") -> object:
-    return str(value).lstrip(chars) if chars else str(value).lstrip()
+    return _text(value).lstrip(chars) if chars else _text(value).lstrip()
 
 
 def _rstrip(value: object, chars: str = "") -> object:
-    return str(value).rstrip(chars) if chars else str(value).rstrip()
+    return _text(value).rstrip(chars) if chars else _text(value).rstrip()
 
 
 def _default(value: object, fallback: str = "") -> object:
@@ -99,56 +176,65 @@ def _nth(value: object, index: str = "0") -> object:
 
 def _join(value: object, sep: str = ", ") -> object:
     if isinstance(value, list):
-        return sep.join(str(item) for item in value if item is not None)
-    return str(value)
+        return _bounded_text_join(
+            (_text(item) for item in value if item is not None),
+            sep,
+        )
+    return _text(value)
 
 
 def _basename(value: object) -> object:
-    return PurePosixPath(str(value)).name
+    return PurePosixPath(_text(value)).name
 
 
 def _dirname(value: object) -> object:
-    return str(PurePosixPath(str(value)).parent)
+    return str(PurePosixPath(_text(value)).parent)
 
 
 def _stem(value: object) -> object:
-    return PurePosixPath(str(value)).stem
+    return PurePosixPath(_text(value)).stem
 
 
 def _ext(value: object) -> object:
-    return PurePosixPath(str(value)).suffix
+    return PurePosixPath(_text(value)).suffix
 
 
 def _urlencode(value: object) -> object:
-    return quote(str(value), safe="")
+    text = _text(value)
+    output_size = 0
+    unreserved = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_.-~"
+    for char in text:
+        try:
+            encoded = char.encode("utf-8")
+        except UnicodeEncodeError as exc:
+            raise ExpressionError("expression text is not valid UTF-8") from exc
+        output_size += sum(1 if byte in unreserved else 3 for byte in encoded)
+        _check_text_result_size(output_size)
+    return quote(text, safe="")
 
 
 def _urldecode(value: object) -> object:
-    return unquote(str(value))
+    return unquote(_text(value))
 
 
 def _int(value: object) -> object:
-    try:
-        float_val = float(str(value))
-        if math.isnan(float_val) or math.isinf(float_val):
-            return 0
-        return int(float_val)
-    except (ValueError, TypeError, OverflowError):
-        return 0
+    number = _decimal(value)
+    integer = None if number is None else _integer(number)
+    return 0 if integer is None else integer
 
 
 def _string(value: object) -> object:
     if isinstance(value, list):
-        return ", ".join(str(item) for item in value)
-    return str(value)
+        return _bounded_text_join((_text(item) for item in value), ", ")
+    return _text(value)
 
 
 def _truncate(value: object, length: str = "100") -> object:
-    """Truncate to exact length — no ellipsis appended.
+    """Truncation retains at most ``length`` characters.
 
-    For ellipsis, use ``{x | truncate:97 | append:...}``.
+    An ``append`` pipe may add an ellipsis after truncation.
     """
-    text = str(value)
+    text = _text(value)
     try:
         max_len = int(length)
     except (ValueError, TypeError):
@@ -157,19 +243,19 @@ def _truncate(value: object, length: str = "100") -> object:
 
 
 def _prepend(value: object, prefix: str = "") -> object:
-    return prefix + str(value)
+    return _bounded_text_join((prefix, _text(value)))
 
 
 def _append(value: object, suffix: str = "") -> object:
-    return str(value) + suffix
+    return _bounded_text_join((_text(value), suffix))
 
 
 def _match(value: object, pattern: str = "") -> object:
     if not pattern:
         return ""
     try:
-        match_result = _re_engine.search(pattern, str(value))
-    except _re_engine.error:
+        match_result = _re_engine.search(pattern, _text(value))
+    except (_re_engine.error, RecursionError):
         return ""
     return match_result.group(0) if match_result else ""
 
@@ -178,21 +264,20 @@ def _json_get(value: object, key: str = "") -> object:
     if isinstance(value, str):
         try:
             parsed = json.loads(value)
-        except json.JSONDecodeError:
+        except (json.JSONDecodeError, RecursionError):
             return None
-        if isinstance(parsed, dict):
+        if isinstance(parsed, Mapping):
             return parsed.get(key)
         return None
-    if isinstance(value, dict):
-        return value.get(key)
+    if isinstance(value, Mapping):
+        return thaw_json(cast(JsonValue | JsonWireValue, value.get(key)))
     return None
 
 
 def _flatten(value: object) -> object:
-    """Flatten one level of nesting (non-recursive, matches Terraform model).
+    """One level of a routing array is flattened.
 
-    ``[[1, 2], 3, [4]]`` → ``[1, 2, 3, 4]``. Apply repeatedly for deeper.
-    Non-list input is returned as-is.
+    Nested arrays are expanded once; other values are returned unchanged.
     """
     if not isinstance(value, list):
         return value
@@ -206,107 +291,107 @@ def _flatten(value: object) -> object:
 
 
 def _compact(value: object) -> object:
-    """Remove None values from a list (not empty strings, not 0, not False).
-
-    Matches Ruby/Lodash compact semantics: only None is stripped.
-    Preserves positional correspondence for non-None values.
-    """
+    """Array compaction removes ``None`` and retains other values."""
     if isinstance(value, list):
-        return [v for v in value if v is not None]
+        return [item for item in value if item is not None]
     return value
 
 
 def _pad(value: object, width: str = "2") -> object:
-    """Zero-pad a numeric value to the given width.
+    """Numeric values are zero-padded to the requested width.
 
-    Converts to int first (truncates floats: 3.7 → "03" with width=2).
-    Non-numeric values are returned as-is.
+    Conversion to an integer truncates a fractional value, so ``3.7`` becomes
+    ``"03"`` at width 2. Non-numeric values are returned unchanged.
     """
+    number = _decimal(value)
+    if number is None:
+        return _text(value)
     try:
-        return str(int(float(str(value)))).zfill(int(width))
+        integer = _integer(number)
+        output_width = int(width)
+        if integer is None or output_width > MAX_PIPE_INTEGER_DIGITS:
+            return _text(value)
+        return str(integer).zfill(output_width)
     except (ValueError, OverflowError):
-        return str(value)
+        return _text(value)
 
 
 def _not(value: object) -> object:
-    """Must stay in sync with `_is_truthy`."""
+    """Negation follows Python truth-value testing."""
+
     return not bool(value)
 
 
 def _eq(value: object, expected: str) -> object:
-    return str(value) == expected
+    return _text(value) == expected
 
 
 def _neq(value: object, expected: str) -> object:
-    return str(value) != expected
+    return _text(value) != expected
 
 
 def _gt(value: object, threshold: str) -> object:
-    """Returns False on non-numeric input."""
-    try:
-        return float(value) > float(threshold)
-    except (ValueError, TypeError):
-        return False
+    """Non-numeric input returns ``False``."""
+    left = _decimal(value)
+    right = _decimal(threshold)
+    return left is not None and right is not None and left > right
 
 
 def _lt(value: object, threshold: str) -> object:
-    """Returns False on non-numeric input."""
-    try:
-        return float(value) < float(threshold)
-    except (ValueError, TypeError):
-        return False
+    """Non-numeric input returns ``False``."""
+    left = _decimal(value)
+    right = _decimal(threshold)
+    return left is not None and right is not None and left < right
 
 
 def _in(value: object, *options: str) -> object:
-    """`{x | in(tv, movie, podcast)}`."""
-    return str(value) in options
+    """Expression syntax is ``{edge.kind | in(first, second)}``."""
+    return _text(value) in options
 
 
-BUILTIN_PIPES: Final[types.MappingProxyType[str, Callable[..., object]]] = (
-    types.MappingProxyType(
-        {
-            "upper": _upper,
-            "lower": _lower,
-            "trim": _trim,
-            "title": _title,
-            "replace": _replace,
-            "strip": _strip,
-            "lstrip": _lstrip,
-            "rstrip": _rstrip,
-            "default": _default,
-            "required": _required,
-            "first": _first,
-            "last": _last,
-            "nth": _nth,
-            "join": _join,
-            "basename": _basename,
-            "dirname": _dirname,
-            "stem": _stem,
-            "ext": _ext,
-            "urlencode": _urlencode,
-            "urldecode": _urldecode,
-            "int": _int,
-            "string": _string,
-            "truncate": _truncate,
-            "prepend": _prepend,
-            "append": _append,
-            "match": _match,
-            "json_get": _json_get,
-            "flatten": _flatten,
-            "compact": _compact,
-            "pad": _pad,
-            "not": _not,
-            "eq": _eq,
-            "neq": _neq,
-            "gt": _gt,
-            "lt": _lt,
-            "in": _in,
-        }
-    )
+BUILTIN_PIPES: Final[types.MappingProxyType[str, Callable[..., object]]] = types.MappingProxyType(
+    {
+        "upper": _upper,
+        "lower": _lower,
+        "trim": _trim,
+        "title": _title,
+        "replace": _replace,
+        "strip": _strip,
+        "lstrip": _lstrip,
+        "rstrip": _rstrip,
+        "default": _default,
+        "required": _required,
+        "first": _first,
+        "last": _last,
+        "nth": _nth,
+        "join": _join,
+        "basename": _basename,
+        "dirname": _dirname,
+        "stem": _stem,
+        "ext": _ext,
+        "urlencode": _urlencode,
+        "urldecode": _urldecode,
+        "int": _int,
+        "string": _string,
+        "truncate": _truncate,
+        "prepend": _prepend,
+        "append": _append,
+        "match": _match,
+        "json_get": _json_get,
+        "flatten": _flatten,
+        "compact": _compact,
+        "pad": _pad,
+        "not": _not,
+        "eq": _eq,
+        "neq": _neq,
+        "gt": _gt,
+        "lt": _lt,
+        "in": _in,
+    }
 )
 
 
-# (min_args, max_args) beyond the implicit first `value` parameter.
+# Each pair gives the minimum and maximum number of explicit arguments.
 PIPE_ARITY: Final[dict[str, tuple[int, int]]] = {
     "upper": (0, 0),
     "lower": (0, 0),
