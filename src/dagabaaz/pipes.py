@@ -1,19 +1,19 @@
-"""Built-in pipe functions for the expression engine.
+"""Built-in pipe functions for task-parameter expressions.
 
-Pure transforms that operate on scalar or list values. Each pipe receives
-the current value as its first argument, plus optional string arguments
-from the expression syntax: ``{slug.key | pipe(arg1, arg2)}``.
-
-Growth area — new pipes are added here with one function + one dict entry
-+ one arity entry. No registration decorator, no mutable state.
+Each pipe receives the current value followed by optional string arguments,
+as in ``{edge.key | replace(old,new)}``. Registration requires matching
+entries in ``BUILTIN_PIPES`` and ``PIPE_ARITY``.
+Routing arrays enter this module as tuples, and pipes that create arrays return
+tuples.
+Text conversion restores dictionaries and lists before calling ``str``.
 """
 
 import json
 import math
 import types
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from pathlib import PurePosixPath
-from typing import Final
+from typing import Final, cast
 from urllib.parse import quote, unquote
 
 try:
@@ -23,45 +23,50 @@ except ImportError:
     import warnings
 
     warnings.warn(
-        "google-re2 not installed, falling back to stdlib re. "
-        "User-supplied regex patterns will not have ReDoS protection. "
-        "Install with: pip install google-re2",
+        "google-re2 is not installed; regular expressions will use Python's "
+        "re module without ReDoS protection. Install Dagabaaz with the re2 "
+        "extra to enable protected matching.",
         stacklevel=2,
     )
 
+from dagabaaz.json import JsonValue, freeze_json, thaw_json
 from dagabaaz.models import ExpressionError
 
 
+def _text(value: object) -> str:
+    return str(thaw_json(cast(JsonValue, value)))
+
+
 def _upper(value: object) -> object:
-    return str(value).upper()
+    return _text(value).upper()
 
 
 def _lower(value: object) -> object:
-    return str(value).lower()
+    return _text(value).lower()
 
 
 def _trim(value: object) -> object:
-    return str(value).strip()
+    return _text(value).strip()
 
 
 def _title(value: object) -> object:
-    return str(value).title()
+    return _text(value).title()
 
 
 def _replace(value: object, old: str, new: str = "") -> object:
-    return str(value).replace(old, new)
+    return _text(value).replace(old, new)
 
 
 def _strip(value: object, chars: str = "") -> object:
-    return str(value).strip(chars) if chars else str(value).strip()
+    return _text(value).strip(chars) if chars else _text(value).strip()
 
 
 def _lstrip(value: object, chars: str = "") -> object:
-    return str(value).lstrip(chars) if chars else str(value).lstrip()
+    return _text(value).lstrip(chars) if chars else _text(value).lstrip()
 
 
 def _rstrip(value: object, chars: str = "") -> object:
-    return str(value).rstrip(chars) if chars else str(value).rstrip()
+    return _text(value).rstrip(chars) if chars else _text(value).rstrip()
 
 
 def _default(value: object, fallback: str = "") -> object:
@@ -76,19 +81,19 @@ def _required(value: object) -> object:
 
 
 def _first(value: object) -> object:
-    if isinstance(value, list):
+    if isinstance(value, tuple):
         return value[0] if value else None
     return value
 
 
 def _last(value: object) -> object:
-    if isinstance(value, list):
+    if isinstance(value, tuple):
         return value[-1] if value else None
     return value
 
 
 def _nth(value: object, index: str = "0") -> object:
-    if isinstance(value, list):
+    if isinstance(value, tuple):
         try:
             idx = int(index)
         except (ValueError, TypeError):
@@ -98,38 +103,38 @@ def _nth(value: object, index: str = "0") -> object:
 
 
 def _join(value: object, sep: str = ", ") -> object:
-    if isinstance(value, list):
-        return sep.join(str(item) for item in value if item is not None)
-    return str(value)
+    if isinstance(value, tuple):
+        return sep.join(_text(item) for item in value if item is not None)
+    return _text(value)
 
 
 def _basename(value: object) -> object:
-    return PurePosixPath(str(value)).name
+    return PurePosixPath(_text(value)).name
 
 
 def _dirname(value: object) -> object:
-    return str(PurePosixPath(str(value)).parent)
+    return str(PurePosixPath(_text(value)).parent)
 
 
 def _stem(value: object) -> object:
-    return PurePosixPath(str(value)).stem
+    return PurePosixPath(_text(value)).stem
 
 
 def _ext(value: object) -> object:
-    return PurePosixPath(str(value)).suffix
+    return PurePosixPath(_text(value)).suffix
 
 
 def _urlencode(value: object) -> object:
-    return quote(str(value), safe="")
+    return quote(_text(value), safe="")
 
 
 def _urldecode(value: object) -> object:
-    return unquote(str(value))
+    return unquote(_text(value))
 
 
 def _int(value: object) -> object:
     try:
-        float_val = float(str(value))
+        float_val = float(_text(value))
         if math.isnan(float_val) or math.isinf(float_val):
             return 0
         return int(float_val)
@@ -138,17 +143,17 @@ def _int(value: object) -> object:
 
 
 def _string(value: object) -> object:
-    if isinstance(value, list):
-        return ", ".join(str(item) for item in value)
-    return str(value)
+    if isinstance(value, tuple):
+        return ", ".join(_text(item) for item in value)
+    return _text(value)
 
 
 def _truncate(value: object, length: str = "100") -> object:
-    """Truncate to exact length — no ellipsis appended.
+    """Truncation retains at most ``length`` characters.
 
-    For ellipsis, use ``{x | truncate:97 | append:...}``.
+    An ``append`` pipe may add an ellipsis after truncation.
     """
-    text = str(value)
+    text = _text(value)
     try:
         max_len = int(length)
     except (ValueError, TypeError):
@@ -157,18 +162,18 @@ def _truncate(value: object, length: str = "100") -> object:
 
 
 def _prepend(value: object, prefix: str = "") -> object:
-    return prefix + str(value)
+    return prefix + _text(value)
 
 
 def _append(value: object, suffix: str = "") -> object:
-    return str(value) + suffix
+    return _text(value) + suffix
 
 
 def _match(value: object, pattern: str = "") -> object:
     if not pattern:
         return ""
     try:
-        match_result = _re_engine.search(pattern, str(value))
+        match_result = _re_engine.search(pattern, _text(value))
     except _re_engine.error:
         return ""
     return match_result.group(0) if match_result else ""
@@ -180,69 +185,65 @@ def _json_get(value: object, key: str = "") -> object:
             parsed = json.loads(value)
         except json.JSONDecodeError:
             return None
-        if isinstance(parsed, dict):
-            return parsed.get(key)
+        if isinstance(parsed, Mapping):
+            return freeze_json(parsed.get(key))
         return None
-    if isinstance(value, dict):
-        return value.get(key)
+    if isinstance(value, Mapping):
+        return freeze_json(value.get(key))
     return None
 
 
 def _flatten(value: object) -> object:
-    """Flatten one level of nesting (non-recursive, matches Terraform model).
+    """One level of a routing array is flattened.
 
-    ``[[1, 2], 3, [4]]`` → ``[1, 2, 3, 4]``. Apply repeatedly for deeper.
-    Non-list input is returned as-is.
+    Nested arrays are expanded once; other values are returned unchanged.
     """
-    if not isinstance(value, list):
+    if not isinstance(value, tuple):
         return value
     result: list[object] = []
     for item in value:
-        if isinstance(item, list):
+        if isinstance(item, tuple):
             result.extend(item)
         else:
             result.append(item)
-    return result
+    return tuple(result)
 
 
 def _compact(value: object) -> object:
-    """Remove None values from a list (not empty strings, not 0, not False).
-
-    Matches Ruby/Lodash compact semantics: only None is stripped.
-    Preserves positional correspondence for non-None values.
-    """
-    if isinstance(value, list):
-        return [v for v in value if v is not None]
+    """Array compaction removes ``None`` and retains other values."""
+    if isinstance(value, tuple):
+        return tuple(item for item in value if item is not None)
     return value
 
 
 def _pad(value: object, width: str = "2") -> object:
-    """Zero-pad a numeric value to the given width.
+    """Numeric values are zero-padded to the requested width.
 
-    Converts to int first (truncates floats: 3.7 → "03" with width=2).
-    Non-numeric values are returned as-is.
+    Conversion to an integer truncates a fractional value, so ``3.7`` becomes
+    ``"03"`` at width 2. Non-numeric values are returned unchanged.
     """
     try:
-        return str(int(float(str(value)))).zfill(int(width))
+        return str(int(float(_text(value)))).zfill(int(width))
     except (ValueError, OverflowError):
-        return str(value)
+        return _text(value)
 
 
 def _not(value: object) -> object:
-    """Must stay in sync with `_is_truthy`."""
+    """Negation follows Python truth-value testing."""
+
     return not bool(value)
 
 
 def _eq(value: object, expected: str) -> object:
-    return str(value) == expected
+    return _text(value) == expected
 
 
 def _neq(value: object, expected: str) -> object:
-    return str(value) != expected
+    return _text(value) != expected
 
 
 def _gt(value: object, threshold: str) -> object:
-    """Returns False on non-numeric input."""
+    """Non-numeric input returns ``False``."""
     try:
         return float(value) > float(threshold)
     except (ValueError, TypeError):
@@ -250,7 +251,7 @@ def _gt(value: object, threshold: str) -> object:
 
 
 def _lt(value: object, threshold: str) -> object:
-    """Returns False on non-numeric input."""
+    """Non-numeric input returns ``False``."""
     try:
         return float(value) < float(threshold)
     except (ValueError, TypeError):
@@ -258,8 +259,8 @@ def _lt(value: object, threshold: str) -> object:
 
 
 def _in(value: object, *options: str) -> object:
-    """`{x | in(tv, movie, podcast)}`."""
-    return str(value) in options
+    """Expression syntax is ``{edge.kind | in(first, second)}``."""
+    return _text(value) in options
 
 
 BUILTIN_PIPES: Final[types.MappingProxyType[str, Callable[..., object]]] = (
@@ -306,7 +307,7 @@ BUILTIN_PIPES: Final[types.MappingProxyType[str, Callable[..., object]]] = (
 )
 
 
-# (min_args, max_args) beyond the implicit first `value` parameter.
+# Each pair gives the minimum and maximum number of explicit arguments.
 PIPE_ARITY: Final[dict[str, tuple[int, int]]] = {
     "upper": (0, 0),
     "lower": (0, 0),

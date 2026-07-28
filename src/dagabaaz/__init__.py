@@ -1,8 +1,5 @@
-"""DAG execution engine — graph readiness, artifact routing, and orchestration.
+"""DAG scheduling, named-edge input planning and run lifecycle coordination.
 
-Given a graph of nodes with dependencies, the engine determines readiness,
-routes artifacts through edges with filtering, handles fan-out/fan-in,
-skip cascades, and barrier synchronization.
-
-Persistence and job dispatch are abstracted behind the ``DagStore`` protocol.
+Applications provide persistence, queueing and workers through the library's
+protocols.
 """

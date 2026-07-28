@@ -1,199 +1,104 @@
-"""Binding resolution logic for DAG data flow.
+"""Task-plan parameter resolution from routing fields and run inputs.
 
-Resolution functions accept artifact objects via duck typing
-(getattr + metadata dict), so both ``DagArtifact`` and application-level
-artifact rows work without adapters.
+During planning, expressions can read named input edges and the reserved
+``input`` namespace. The resulting values are stored in the task plan.
 """
 
-import logging
-from typing import Any
+from __future__ import annotations
 
-from dagabaaz.constants import ARTIFACT_STANDARD_FIELDS
-from dagabaaz.expressions import Lookup, extract_refs, resolve_expression
+from collections.abc import Mapping, Sequence
+from types import MappingProxyType
+
+from dagabaaz.expressions import Lookup, resolve_expression
+from dagabaaz.json import FrozenDict, JsonValue, freeze_json, freeze_object
 from dagabaaz.models import (
-    ConfigSource,
-    DagArtifactLike,
-    ExpressionError,
+    EdgeSource,
     ExpressionSource,
-    InputBinding,
-    NodeSource,
+    LiteralSource,
+    NodeDefinition,
+    OutputRef,
+    PlanningError,
     RuntimeSource,
+    SecretSource,
 )
 
-logger = logging.getLogger(__name__)
+_MISSING = object()
 
 
-def extract_artifact_field(artifacts: list[DagArtifactLike], key: str) -> list[object]:
-    """Extract a field from artifact attributes or metadata, preserving native types.
+def extract_edge_field(outputs: Sequence[OutputRef], field: str) -> JsonValue:
+    """Field extraction yields ``None``, one value or an ordered tuple."""
 
-    The pipe layer handles type-specific behavior (string pipes coerce
-    on entry via ``str()``; structured pipes ``isinstance``-check), so
-    pre-coercing here would silently break ``json_get`` and friends.
-    """
-    values: list[object] = []
-    for artifact in artifacts:
-        if key in ARTIFACT_STANDARD_FIELDS:
-            field_value = getattr(artifact, key)
-            if field_value is not None:
-                values.append(field_value)
-        elif key in artifact.metadata:
-            values.append(artifact.metadata[key])
-        else:
-            # Surface binding typos (e.g. "file_paht") — silent drops
-            # produce empty results with zero diagnostic signal.
-            logger.debug(
-                "Artifact '%s' has no field '%s' (standard or metadata)",
-                getattr(artifact, "file_name", "?"),
-                key,
-            )
-    return values
-
-
-def _unwrap_field(
-    artifacts: list[DagArtifactLike], key: str
-) -> object | list[object] | None:
-    """Extract a field from artifacts, returning scalar for single values.
-
-    Shared by resolve_binding (NodeSource) and build_expression_lookup
-    to avoid duplicating the extract → unwrap logic.
-    """
-    resolved = extract_artifact_field(artifacts, key)
-    if len(resolved) == 1:
-        return resolved[0]
-    return resolved if resolved else None
-
-
-def resolve_binding(
-    binding: NodeSource | ConfigSource | RuntimeSource | ExpressionSource,
-    artifacts_by_node: dict[int, list[DagArtifactLike]],
-    slug_to_node_index: dict[str, int],
-    run_input: dict[str, object],
-    node_config: dict[str, Any] | None = None,
-) -> object | None:
-    """Resolve a single binding to its value."""
-    match binding:
-        case NodeSource(node=node, key=key):
-            idx = slug_to_node_index.get(node)
-            if idx is None:
-                return None
-            return _unwrap_field(artifacts_by_node.get(idx, []), key)
-
-        case RuntimeSource(key=key, default=default):
-            if key in run_input:
-                return run_input[key]
-            return default or None
-
-        case ConfigSource(value=value):
-            return value if value else None
-
-        case ExpressionSource(expression=expression):
-            return resolve_expression(
-                expression,
-                build_expression_lookup(
-                    artifacts_by_node,
-                    slug_to_node_index,
-                    run_input,
-                    node_config or {},
-                ),
-            )
-
-        case _:
-            return None
+    values = [output.fields[field] for output in outputs if field in output.fields]
+    if not values:
+        return None
+    if len(values) == 1:
+        return values[0]
+    return tuple(values)
 
 
 def build_expression_lookup(
-    artifacts_by_node: dict[int, list[DagArtifactLike]],
-    slug_to_node_index: dict[str, int],
-    run_input: dict[str, object],
-    node_config: dict[str, Any],
+    outputs_by_edge: Mapping[str, Sequence[OutputRef]],
+    runtime_inputs: Mapping[str, JsonValue],
 ) -> Lookup:
-    """Build a lookup function for expression resolution.
-
-    Maps (namespace, key) to values from three sources:
-      - node slug -> artifact field via extract_artifact_field
-      - "input"  -> run_input dict
-      - "config" -> node config dict
-
-    **Caller must not mutate inputs after creating the lookup** — the
-    closure captures references, not snapshots.
-    """
+    """The lookup reads named-edge routing fields and frozen run input."""
 
     def lookup(namespace: str, key: str) -> object | None:
         if namespace == "input":
-            return run_input.get(key)
-        if namespace == "config":
-            return node_config.get(key)
-        idx = slug_to_node_index.get(namespace)
-        if idx is None:
+            return runtime_inputs.get(key)
+        outputs = outputs_by_edge.get(namespace)
+        if outputs is None:
             return None
-        arts = artifacts_by_node.get(idx, [])
-        return _unwrap_field(arts, key)
+        return extract_edge_field(outputs, key)
 
     return lookup
 
 
-def extract_node_indices_from_bindings(
-    bindings: dict[str, InputBinding],
-    slug_to_node_index: dict[str, int],
-) -> set[int]:
-    """Collect all node indices needed by NodeSource/ExpressionSource bindings
-    and their `when` clauses.
+def resolve_plan_bindings(
+    node: NodeDefinition,
+    outputs_by_edge: Mapping[str, Sequence[OutputRef]],
+    runtime_inputs: Mapping[str, JsonValue],
+    *,
+    base_parameters: Mapping[str, JsonValue] | None = None,
+) -> tuple[FrozenDict, Mapping[str, str]]:
+    """Plan bindings yield parameters and secret references.
+
+    ``base_parameters`` provides the initial parameters for a root task. An
+    active binding replaces a parameter with the same name. An inactive
+    conditional binding leaves it unchanged.
     """
-    indices: set[int] = set()
-    for binding in bindings.values():
-        match binding:
-            case NodeSource(node=node):
-                idx = slug_to_node_index.get(node)
-                if idx is not None:
-                    indices.add(idx)
-            case ExpressionSource(expression=expression):
-                slugs, _ = extract_refs(expression)
-                for slug in slugs:
-                    idx = slug_to_node_index.get(slug)
-                    if idx is not None:
-                        indices.add(idx)
 
-        if binding.when:
-            # Asymmetric with the ExpressionSource branch by design:
-            # validate_binding_references is the save-time gate, so a bad
-            # `when` at runtime is logged-and-skipped rather than fatal.
-            try:
-                when_slugs, _ = extract_refs(binding.when)
-            except ExpressionError:
-                continue
-            for slug in when_slugs:
-                idx = slug_to_node_index.get(slug)
-                if idx is not None:
-                    indices.add(idx)
-    return indices
+    lookup = build_expression_lookup(outputs_by_edge, runtime_inputs)
+    parameters = dict(base_parameters or {})
+    secret_refs: dict[str, str] = {}
 
+    for name, binding in node.bindings.items():
+        if binding.when is not None and not bool(resolve_expression(binding.when, lookup)):
+            continue
 
-def any_binding_requires_run_input(
-    bindings: dict[str, InputBinding],
-) -> bool:
-    """Check if any binding needs run input (RuntimeSource, expression, or
-    `when` clause referencing input.*).
-    """
-    for binding in bindings.values():
-        match binding:
-            case RuntimeSource():
-                return True
-            case ExpressionSource(expression=expression):
-                try:
-                    _, runtime_keys = extract_refs(expression)
-                except ExpressionError:
-                    logger.warning(
-                        "Bad expression in binding, skipping: %s", expression
-                    )
-                    continue
-                if runtime_keys:
-                    return True
+        if isinstance(binding, EdgeSource):
+            value = extract_edge_field(outputs_by_edge.get(binding.edge, ()), binding.field)
+        elif isinstance(binding, LiteralSource):
+            value = binding.value
+        elif isinstance(binding, RuntimeSource):
+            value = runtime_inputs.get(binding.key, _MISSING)
+            if value is _MISSING:
+                value = binding.default
+            if binding.required and (value is None or value == ""):
+                raise PlanningError(f"required runtime input {binding.key!r} is missing")
+        elif isinstance(binding, ExpressionSource):
+            value = resolve_expression(binding.expression, lookup)
+        elif isinstance(binding, SecretSource):
+            parameters.pop(name, None)
+            secret_refs[name] = binding.name
+            continue
+        else:
+            raise PlanningError(f"unsupported binding for parameter {name!r}")
 
-        if binding.when:
-            try:
-                _, when_keys = extract_refs(binding.when)
-            except ExpressionError:
-                continue
-            if when_keys:
-                return True
-    return False
+        try:
+            parameters[name] = freeze_json(value)
+        except ValueError as exc:
+            raise PlanningError(
+                f"parameter {name!r} did not resolve to JSON-compatible data: {exc}"
+            ) from exc
+
+    return freeze_object(parameters), MappingProxyType(secret_refs)

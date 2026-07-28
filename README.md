@@ -2,237 +2,142 @@
 
 A Python library that orchestrates multi-step workflows as directed acyclic graphs. You define the steps and their dependencies; the engine handles scheduling, data routing, and failures.
 
-```
+```shell
 pip install dagabaaz
 ```
 
-Requires Python 3.12+. Optional: `google-re2` for ReDoS-safe regex in pipe expressions.
+Python 3.12 or later is required. The optional `re2` extra protects pipe expressions that use regular expressions from ReDoS attacks.
 
-## Why This Exists
+## Purpose
 
-Most DAG engines (Airflow, Prefect, Dagster) are platforms. They own the scheduler, the database, the UI, and the execution runtime. If you're building a product where pipelines are a *feature* rather than the whole product, you don't want a platform. You want a library you call from your own code.
+Dagabaaz is intended for applications that already provide their own database, queue and worker runtime. The application supplies storage and queueing through Python protocols.
 
-Persistence and dispatch are behind a `Protocol`. Bring your own database and queue.
+## Pipeline definition
 
-## Quick Start
-
-### 1. Define a pipeline
-
-A pipeline is a list of `DagNode` objects. Each node has a slug (unique ID), a plugin name, and optional dependencies.
+A pipeline is a list of `DagNode` objects. Each node has a slug and a plugin name. Non-root nodes have named input edges that connect them to upstream nodes.
 
 ```python
-from dagabaaz.models import DagNode
-from dagabaaz.constants import FanMode
+from dagabaaz.constants import InputMode, InputRole
+from dagabaaz.models import DagNode, EdgeSource, InputEdge
 
 nodes = [
-    DagNode(slug="source", plugin="fetch"),
-    DagNode(slug="process", plugin="transform", depends_on=["source"]),
+    DagNode(slug="load", plugin="load"),
+    DagNode(slug="settings", plugin="load_settings"),
     DagNode(
-        slug="export",
-        plugin="export",
-        depends_on=["process"],
-        fan_mode=FanMode.AGGREGATE,
+        slug="transform",
+        plugin="transform",
+        input_mode=InputMode.EACH,
+        edges=(InputEdge(name="records", source="load"),),
+        bindings={"title": EdgeSource(edge="records", field="title")},
+    ),
+    DagNode(
+        slug="publish",
+        plugin="publish",
+        input_mode=InputMode.ALL,
+        edges=(
+            InputEdge(name="results", source="transform"),
+            InputEdge(
+                name="settings",
+                source="settings",
+                role=InputRole.SIDE,
+                required=False,
+            ),
+        ),
     ),
 ]
 ```
 
-### 2. Implement `DagStore`
+`InputMode.EACH` creates one task for each selected output on its main edge. `InputMode.ALL` creates one task with all selected outputs. `InputMode.BY_CORRELATION` creates one task for each retained correlation ID.
 
-The engine talks to your infrastructure through the `DagStore` protocol (see `store.py`). The three most important methods:
+Filters and selection belong to an `InputEdge`. Bindings refer to an edge by name.
+
+## Store integration
+
+The application provides storage and queueing through a `DagStore` implementation. The excerpt below shows the planning and finalisation methods; a complete store must implement the full protocol.
 
 ```python
-class MyStore:
-    def get_barrier_state(self, run_id, node_index):
-        # Return (run_status, total_tasks, completed_tasks)
-        ...
+class AppStore:
+    def get_run_nodes(self, run_id): ...
 
-    def try_claim_node_launch(self, run_id, node_index) -> bool:
-        # Returns True if this call claimed the node
-        ...
+    def get_planning_snapshot(self, run_id, node_index, edges): ...
 
-    def dispatch_task(self, run_id, node_index, plugin_name, input_artifact_id) -> str:
-        # Create task record, push to your job queue, return task_id
-        ...
+    def try_create_node_launch(
+        self,
+        run_id,
+        node_index,
+        plugin_name,
+        snapshot_token,
+        plans,
+        zero_task_disposition,
+        error="",
+    ): ...
+
+    def try_finalize_run(self, run_id, status, error, *, cause=None): ...
 ```
 
-### 3. Start a run
+`try_create_node_launch` checks the snapshot token and writes the node launch, tasks, plans and queue outbox entries in one transaction. The orchestrator's store protocol is in [`store.py`](src/dagabaaz/store.py).
+
+## Run lifecycle
+
+The application stores the run and its node definitions before it calls `start_run`.
 
 ```python
-from dagabaaz.orchestrator import start_run
-
-root_indices = start_run(store, run_id="run-1", nodes=nodes)
-```
-
-### 4. Build task input
-
-On the worker side, use `build_task_input` to assemble the data your plugin needs:
-
-```python
-from dagabaaz.task_input import build_task_input
-
-input_data = build_task_input(
-    store,
-    run_id="run-1",
-    node_index=1,
-    input_artifact_id="artifact-xyz",
-    nodes=nodes,
-)
-```
-
-### 5. Handle task completion
-
-After your worker executes a task, call back into the engine so it can dispatch the next steps:
-
-```python
-from dagabaaz.orchestrator import on_task_complete, OrchestratorCallbacks
+from dagabaaz.orchestrator import OrchestratorCallbacks, start_run
 
 callbacks = OrchestratorCallbacks(
-    on_run_completed=lambda run_id: print(f"Run {run_id} done"),
-    on_run_failed=lambda run_id: print(f"Run {run_id} failed"),
-    on_run_crashed=lambda run_id: print(f"Run {run_id} crashed"),
-    on_run_cancelled=lambda run_id: print(f"Run {run_id} cancelled"),
+    on_run_completed=lambda run_id: print("completed", run_id),
+    on_run_failed=lambda run_id: print("failed", run_id),
+    on_run_crashed=lambda run_id: print("crashed", run_id),
+    on_run_cancelled=lambda run_id: print("cancelled", run_id),
 )
 
-on_task_complete(
-    store,
-    task_id="task-1",
-    callbacks=callbacks,
-    resolve_passthrough=lambda plugin: False,
-)
+start_run(store, "run-1", callbacks=callbacks)
 ```
 
-`on_task_complete` must be serialized per run (e.g. with a lock per run ID). `try_claim_node_launch` and `try_claim_run_terminal` must be atomic.
+A worker adapter first checks the queued attempt ID and plan generation. It then records task completion and the task's outputs in one application-defined transaction. After that transaction commits, `on_task_complete` checks whether another node is ready.
 
-## Pipeline Patterns
+`on_task_failed` and `on_task_crashed` receive the queued attempt ID. The store updates the task only if that attempt is still current. `try_finalize_run` repeats the attempt check before changing the run status, which protects a replacement attempt created by a concurrent retry. The same transaction rejects invalid terminal transitions and cancels unfinished tasks.
 
-### Linear
+## Task inputs
+
+Each task stores a `TaskInputPlan`, which records the selected output IDs under their edge names. Workers use the routing decision made during planning.
 
 ```python
-nodes = [
-    DagNode(slug="fetch", plugin="fetch"),
-    DagNode(slug="transform", plugin="transform", depends_on=["fetch"]),
-    DagNode(slug="export", plugin="export", depends_on=["transform"]),
-]
+from dagabaaz.task_input import resolve_task_inputs
+
+inputs = resolve_task_inputs(output_store, run_id="run-1", plan=plan)
+record = inputs.edges["records"][0]
+print(record.fields, record.data, inputs.parameters)
 ```
 
-### Fan-out / scatter-gather
+The output resolver must return the requested IDs and no others. Dagabaaz restores the order recorded in the plan. A missing or extra ID raises `MaterializationError`.
 
-A source produces multiple files. Two branches process each file in parallel. The merge node collects results that came from the same original file. If the source produced 10 files and there are 2 branches, the merge node gets 10 tasks, each with 2 results.
+`OutputRef.fields` contains the JSON used for filtering, selection, expressions and bindings. `ResolvedOutput.data` contains values needed by the plugin, such as paths, URLs or records. The routing decision is fixed before the worker materialises those values.
 
-```python
-nodes = [
-    DagNode(slug="source", plugin="fetch"),
-    DagNode(slug="branch_a", plugin="process_a", depends_on=["source"]),
-    DagNode(slug="branch_b", plugin="process_b", depends_on=["source"]),
-    DagNode(
-        slug="merge",
-        plugin="merge",
-        depends_on=["branch_a", "branch_b"],
-        fan_mode=FanMode.GROUPED,
-    ),
-]
-```
+Each root `TaskInputPlan.parameters` stores the complete merged run input. The worker receives the same mapping as `TaskInputs.parameters`. An active binding replaces a parameter with the same name. Non-root nodes receive runtime values only through bindings and expressions.
 
-### Conditional routing with edge filters
+JSON equality in filters preserves JSON types at every nesting level: booleans do not equal numbers, arrays retain order and object key order is ignored.
 
-Edge filters route artifacts to different branches by type. Video files go to one branch, subtitles to another.
+`SecretSource` stores a reference name in `TaskInputPlan.secret_refs`; the worker adapter resolves that reference. Secret values are not stored in task plans.
 
-```python
-from dagabaaz.models import DagNode, EdgeFilter, FilterRule
-from dagabaaz.constants import FanMode, FilterOperator
+## Correlation
 
-nodes = [
-    DagNode(slug="source", plugin="fetch"),
-    DagNode(
-        slug="video",
-        plugin="transcode",
-        depends_on=["source"],
-        fan_mode=FanMode.AGGREGATE,
-        edge_filters={
-            "source": EdgeFilter(
-                rules=[
-                    FilterRule(
-                        field="file_type", operator=FilterOperator.EQ, value="video"
-                    )
-                ]
-            )
-        },
-    ),
-    DagNode(
-        slug="subtitle",
-        plugin="parse_subs",
-        depends_on=["source"],
-        edge_filters={
-            "source": EdgeFilter(
-                rules=[
-                    FilterRule(
-                        field="file_type", operator=FilterOperator.EQ, value="subtitle"
-                    )
-                ]
-            )
-        },
-    ),
-]
-```
+A correlation ID identifies outputs that belong to the same routing group. `BY_CORRELATION` uses the ID to combine outputs from parallel branches.
 
-When `source` produces a mix of `.mp4` and `.srt` files, the engine routes each type to the correct branch. If a branch receives no artifacts (e.g., no subtitles), it is marked `filtered` and does not block downstream nodes.
+The application calls `correlation_id_for_output` when it creates an `OutputRef`. With `CorrelationMode.DEFAULT`, each root output starts a group, outputs from `EACH` and `BY_CORRELATION` inherit the task plan's group, and outputs from `ALL` have no correlation ID. An explicit `CorrelationMode` overrides these defaults.
 
-### Conditional bindings with `when`
+Applications may store parent-child output links when they need an execution history.
 
-A `when` clause gates a binding on an expression; the field is populated only when `when` evaluates truthy.
+## Retries
 
-```python
-from dagabaaz.models import DagNode, NodeSource
+`retry_task` creates another attempt for a crashed task with its existing plan while the run remains active. The caller supplies the current attempt ID so a stale retry cannot replace a later attempt.
 
-nodes = [
-    DagNode(slug="lookup", plugin="library_lookup"),
-    DagNode(
-        slug="create",
-        plugin="create_record",
-        depends_on=["lookup"],
-        bindings={
-            "title": NodeSource(node="lookup", key="title"),
-            "thumbnail_url": NodeSource(
-                node="lookup",
-                key="thumbnail_url",
-                when="{lookup.existing_id | not}",
-            ),
-        },
-    ),
-]
-```
+For a failed or crashed run, `retry_run` takes a node boundary. It restarts the boundary and every incomplete or failed launch, together with their descendants. Completed siblings outside this set remain in place.
 
-The clause uses the same expression language as `ExpressionSource` bindings.
+For a run with `CANCELLED` status, `retry_run` takes no boundary and restarts its incomplete work. This also covers a run cancelled before any node was launched.
 
-## Concepts
+The store checks the run status and affected nodes while holding the run lock. It increments the retry count, advances the affected plan generations and invalidates the affected launches in the same transaction. The application must serialise a retry with terminal handlers for the same run until the terminal callback has returned. Cleanup and `reconcile_run` may follow only after the retry succeeds.
 
-A pipeline is a graph of **nodes**. Each node wraps a plugin and declares which other nodes it depends on. When you execute a pipeline, that execution is called a **run**.
-
-A node doesn't run until all its dependencies have finished -- this is **barrier sync**. Once a node runs, each execution of it is a **task**, and each task produces **artifacts** (files with optional metadata). A node's **fan mode** controls how many tasks it spawns: one per upstream artifact (single), one for all of them (aggregate), or one per group of related artifacts (grouped). Grouped mode uses **origin artifact** tracking to know which artifacts belong together -- if 10 files fan out through 3 branches, the merge node gets 10 tasks, each with 3 results.
-
-**Edge filters** sit between nodes and decide which artifacts pass through. All rules must match (AND logic). **Input bindings** control how a task gets its data: from an upstream artifact field, a literal config value, user-provided run input, or an expression template.
-
-When a node's upstream is dead, the node is **skipped** and that cascades to everything downstream. When a node simply has no artifacts to work with (edge filter rejected all), it is **filtered** -- this does not cascade. If a filtered node is a routing node (**passthrough**), the engine walks past it to find artifacts from further upstream. Processing nodes block this walk.
-
-A task or run that can't transition further is in a **terminal state**. Tasks end as `completed`, `failed`, `crashed`, `cancelled`, `skipped`, or `filtered`. Runs end as `completed`, `failed`, `crashed`, or `cancelled`.
-
-## Expression Language
-
-Input bindings can use `{namespace.key | pipe}` expressions:
-
-```python
-"{source.file_path}"  # artifact field
-"{source.title | upper | truncate(50)}"  # with transforms
-"{list(branch_a.url, branch_b.url) | join(,)}"  # multiple sources
-"{input.api_url | required}"  # run input
-"{config.output_format | default(mp4)}"  # config value
-"{source.shareable_urls | json_get(embed_urls)}"  # navigate dict metadata
-```
-
-Built-in pipes include `upper`, `lower`, `default`, `required`, `join`, `basename`, `match`, `json_get`, and others. See [`pipes.py`](src/dagabaaz/pipes.py) for the full list.
-
-Expressions are validated at pipeline save time and evaluated at task execution time.
-
-## License
+## Licence
 
 MIT

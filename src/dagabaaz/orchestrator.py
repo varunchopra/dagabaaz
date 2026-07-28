@@ -1,366 +1,136 @@
-"""DAG orchestration — barrier sync, node launching, skip/filter cascade, lifecycle.
+"""Persisted-state reconciliation and run lifecycle transitions.
 
-Key algorithms:
-- Barrier sync: a node is ready when ALL its dependency nodes have all
-  tasks completed/skipped/filtered.
-- Reconciliation: readiness is computed from persisted state, not from
-  the just-completed event. ``on_task_complete`` and external callers
-  (e.g. retry) both delegate to ``reconcile_run``, which discovers every
-  ready node regardless of which prior event last touched its parents.
-- Skip cascade: if any dependency is fully skipped (upstream dead), the
-  downstream node is also skipped. Cascades through the entire subgraph.
-- Filtered (non-cascading): when a node has no artifacts, it is marked
-  ``filtered``. Downstream nodes still attempt artifact collection.
-- Fan modes: SINGLE dispatches one task per artifact (with a max fan-out
-  guard of 200). AGGREGATE dispatches one task for all artifacts. GROUPED
-  dispatches one task per origin group.
-- External termination: ``abort_run`` terminates a run from outside the
-  normal task lifecycle (e.g. run-level deadline, user cancellation).
-  For task-level timeouts, use ``on_task_failed`` instead.
+The orchestrator plans nodes whose source launches are complete. Stores create
+launches, tasks, plans and queue outbox rows together, so repeated reconciliation
+does not duplicate work.
 """
+
+from __future__ import annotations
 
 import logging
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Literal
 
 from dagabaaz.constants import (
-    MAX_FAN_OUT,
+    MAX_SNAPSHOT_RETRIES,
     RUN_TERMINAL_STATUSES,
-    FanMode,
-    NodeSummaryStatus,
+    LaunchCreateStatus,
+    NodeDisposition,
     RunStatus,
 )
-from dagabaaz.filter import filter_artifacts, group_by_origin
-from dagabaaz.graph import (
-    collect_upstream_artifacts_bfs,
-    find_ready_nodes,
-    find_root_nodes,
-)
-from dagabaaz.models import DagArtifact, DagNode, EdgeFilter
-from dagabaaz.store import DagStore
-from dagabaaz.topology import ResolvePassthrough, RunTopology
+from dagabaaz.graph import find_ready_nodes, find_root_nodes
+from dagabaaz.models import NodeLaunch, TaskInputPlan
+from dagabaaz.planning import construct_task_plans
+from dagabaaz.store import DagStore, StoreContractError, TaskAttemptRef
+from dagabaaz.topology import RunTopology
 
 logger = logging.getLogger(__name__)
 
-OnRunCompleted = Callable[[str], None]
-"""Called when a run completes. Receives run_id only — the application
-captures cursor/queue in a closure, keeping the engine free of those types."""
-
-OnRunFailed = Callable[[str], None]
-"""Called when a run fails. Receives run_id."""
-
-OnRunCrashed = Callable[[str], None]
-"""Called when a run crashes (infra failure). Receives run_id."""
-
-OnRunCancelled = Callable[[str], None]
-"""Called when a run is cancelled externally. Receives run_id."""
+RunCallback = Callable[[str], None]
 
 
 @dataclass(frozen=True, slots=True)
 class OrchestratorCallbacks:
-    """Grouped lifecycle callbacks for the DAG engine."""
+    """Callbacks invoked after a successful terminal transition.
 
-    on_run_completed: OnRunCompleted
-    on_run_failed: OnRunFailed
-    on_run_crashed: OnRunCrashed
-    on_run_cancelled: OnRunCancelled
-
-
-@dataclass(frozen=True, slots=True)
-class LaunchResult:
-    """Outcome of a single node launch attempt.
-
-    Separates "0 tasks because skip/filter" from "0 tasks because fatal error".
-    The caller inspects ``disposition`` to decide whether to propagate a skip
-    cascade (skipped/filtered) or abort the entire run (failed).
+    The application serialises terminal handlers and boundary retries for a run
+    until the callback returns.
     """
 
-    tasks_created: int
-    disposition: Literal["launched", "skipped", "filtered", "failed"]
-    error: str = ""
+    on_run_completed: RunCallback
+    on_run_failed: RunCallback
+    on_run_crashed: RunCallback
+    on_run_cancelled: RunCallback
+
+
+def _terminal_failure(
+    store: DagStore,
+    *,
+    run_id: str,
+    status: RunStatus,
+    error: str,
+    callbacks: OrchestratorCallbacks,
+    cause: TaskAttemptRef | None = None,
+) -> bool:
+    """Finalisation, including cancellation, completes before the callback."""
+
+    if not store.try_finalize_run(run_id, status, error, cause=cause):
+        return False
+    if status == RunStatus.CRASHED:
+        callbacks.on_run_crashed(run_id)
+    elif status == RunStatus.CANCELLED:
+        callbacks.on_run_cancelled(run_id)
+    else:
+        callbacks.on_run_failed(run_id)
+    return True
 
 
 def start_run(
     store: DagStore,
     run_id: str,
-    nodes: list[DagNode],
+    *,
+    callbacks: OrchestratorCallbacks,
 ) -> list[int]:
-    """Find root nodes, claim them, and dispatch tasks. Returns root indices.
+    """Stored topology is validated and reconciled before root indices are returned."""
 
-    This is the standard way to start a DAG run. Root nodes (no
-    dependencies) are identified, atomically claimed via
-    ``try_claim_node_launch``, and dispatched with no input artifact
-    (root tasks receive the user's run input instead).
-
-    Raises ``ValueError`` if the graph definition is invalid or empty.
-    """
-    root_indices = find_root_nodes(nodes)
-    if not root_indices:
-        raise ValueError("Pipeline has no nodes")
-
-    dispatched: list[int] = []
-    for node_idx in root_indices:
-        if not store.try_claim_node_launch(run_id, node_idx):
-            continue
-        store.dispatch_task(run_id, node_idx, nodes[node_idx].plugin, None)
-        dispatched.append(node_idx)
-
-    logger.info(
-        "Run %s: dispatched %d root node(s) %s", run_id, len(dispatched), dispatched
-    )
-    return root_indices  # Full set — callers need structural info
+    nodes = store.get_run_nodes(run_id)
+    if nodes is None:
+        raise ValueError(f"run {run_id!r} has no stored node definition")
+    roots = find_root_nodes(nodes)
+    reconcile_run(store, run_id, callbacks=callbacks)
+    return roots
 
 
-def _collect_and_filter_per_edge(
-    store: DagStore,
-    run_id: str,
-    dependency_indices: list[int],
-    dep_adjacency: list[list[int]],
-    edge_filters: dict[int, EdgeFilter],
+def _validate_launch_result(
     *,
-    passthrough_indices: set[int] | None = None,
-) -> tuple[list[DagArtifact], bool]:
-    """Collect artifacts per dependency edge, apply per-edge filters, merge.
-
-    Returns (merged_artifacts, is_gate_rejected).
-
-    is_gate_rejected is True when at least one filtered edge had all its
-    artifacts eliminated — upstream had data, a filter was active, and
-    the filter rejected everything. This distinguishes deliberate rejection
-    from an empty upstream (gate passthrough).
-    """
-    if not dependency_indices:
-        return [], False
-
-    is_gate_rejected = False
-    all_artifacts: list[DagArtifact] = []
-
-    for dep_idx in dependency_indices:
-        dep_artifacts = collect_upstream_artifacts_bfs(
-            store,
-            run_id,
-            [dep_idx],
-            dep_adjacency,
-            passthrough_indices=passthrough_indices,
-        )
-        if not dep_artifacts:
-            continue
-
-        dep_filter = edge_filters.get(dep_idx)
-        if dep_filter and (dep_filter.rules or dep_filter.select):
-            before_count = len(dep_artifacts)
-            dep_artifacts = filter_artifacts(dep_artifacts, dep_filter)
-            if before_count != len(dep_artifacts):
-                logger.info(
-                    "Edge %d filter: %d -> %d artifact(s)",
-                    dep_idx,
-                    before_count,
-                    len(dep_artifacts),
-                )
-            if not dep_artifacts:
-                is_gate_rejected = True
-
-        all_artifacts.extend(dep_artifacts)
-
-    return all_artifacts, is_gate_rejected
-
-
-def _collect_grouped_origin_ids(
-    store: DagStore,
-    run_id: str,
-    dependency_indices: list[int],
-    dep_adjacency: list[list[int]],
-    edge_filters: dict[int, EdgeFilter],
-    passthrough_indices: set[int] | None,
-) -> tuple[list[str], bool]:
-    origin_ids: dict[str, None] = {}
-    has_broadcast = False
-
-    for dependency_index in dependency_indices:
-        artifacts = collect_upstream_artifacts_bfs(
-            store,
-            run_id,
-            [dependency_index],
-            dep_adjacency,
-            passthrough_indices=passthrough_indices,
-        )
-        grouped = group_by_origin(artifacts)
-        edge_filter = edge_filters.get(dependency_index)
-        selector_filter = (
-            EdgeFilter(select=edge_filter.select)
-            if edge_filter and edge_filter.select
-            else None
-        )
-
-        filtered_broadcast = grouped.broadcast
-        if edge_filter and (edge_filter.rules or edge_filter.select):
-            filtered_broadcast = filter_artifacts(grouped.broadcast, edge_filter)
-        has_broadcast = has_broadcast or bool(filtered_broadcast)
-
-        for origin_id, correlated in grouped.groups.items():
-            if edge_filter and (edge_filter.rules or edge_filter.select):
-                filtered_correlated = filter_artifacts(correlated, edge_filter)
-                if selector_filter:
-                    candidates = filtered_correlated + filtered_broadcast
-                    filtered_correlated = filter_artifacts(
-                        candidates, selector_filter
-                    )
-            else:
-                filtered_correlated = correlated
-
-            if (
-                filtered_correlated
-                and filtered_correlated[0].origin_artifact_id == origin_id
-            ):
-                origin_ids.setdefault(origin_id, None)
-                if len(origin_ids) > MAX_FAN_OUT:
-                    return list(origin_ids), has_broadcast
-
-    return list(origin_ids), has_broadcast
-
-
-def _launch_node(
-    store: DagStore,
-    *,
+    status: LaunchCreateStatus,
     run_id: str,
     node_index: int,
-    topology: RunTopology,
-    node_completion_map: dict[int, NodeSummaryStatus] | None,
-) -> LaunchResult:
-    """Launch tasks for a single node. Returns a LaunchResult.
+    plugin_name: str,
+    generation: int,
+    plans: tuple[TaskInputPlan, ...],
+    zero_disposition: NodeDisposition | None,
+    launch: object,
+) -> NodeLaunch:
+    """A store-created launch must match the accepted operation."""
 
-    Skip and filter semantics (conditional branching):
-    - If ANY dependency was entirely skipped -> this node is **skipped** (cascading).
-    - If an aggregate/grouped node's edge filter rejects all artifacts ->
-      **skipped** (cascading).
-    - If a non-root node has no artifacts after collection -> **filtered** (non-cascading).
-      This covers two cases: edge filters rejected everything, or BFS stopped at
-      a non-passthrough node upstream. Passthrough nodes (Gate) let BFS walk
-      through to find artifacts from further upstream; non-passthrough nodes
-      (processors) block BFS and create a natural cascade
-      through artifact absence.
-
-    Returns a ``LaunchResult`` with ``disposition`` indicating the outcome.
-    The caller inspects ``disposition == "failed"`` to abort the run, and
-    ``tasks_created == 0`` (skip/filter) to propagate cascades in-memory.
-    """
-    nodes = topology.nodes
-    deps = topology.deps
-    passthrough_indices = topology.passthrough_indices
-
-    node = nodes[node_index]
-    dependency_indices = deps[node_index]
-    edge_filters = topology.edge_filters[node_index]
-    plugin_name = node.plugin
-    fan_mode = node.fan_mode
-
-    if node_completion_map and dependency_indices:
-        for dep_idx in dependency_indices:
-            if node_completion_map.get(dep_idx) == NodeSummaryStatus.SKIPPED:
-                store.dispatch_skipped_task(run_id, node_index, plugin_name)
-                logger.info(
-                    "Node %d skipped (dependency %d was skipped)",
-                    node_index,
-                    dep_idx,
-                )
-                return LaunchResult(0, "skipped")
-
-    if fan_mode == FanMode.GROUPED and dependency_indices:
-        origin_ids, has_broadcast = _collect_grouped_origin_ids(
-            store,
-            run_id,
-            dependency_indices,
-            deps,
-            edge_filters,
-            passthrough_indices,
-        )
-        if len(origin_ids) > MAX_FAN_OUT:
-            error = (
-                f"Grouped fan-out limit exceeded: "
-                f"{len(origin_ids)} groups (max {MAX_FAN_OUT})"
-            )
-            logger.error("Node %d: %s", node_index, error)
-            return LaunchResult(0, "failed", error)
-        if origin_ids:
-            for origin_id in origin_ids:
-                store.dispatch_grouped_task(
-                    run_id, node_index, plugin_name, origin_id
-                )
-            return LaunchResult(len(origin_ids), "launched")
-        if has_broadcast:
-            store.dispatch_task(run_id, node_index, plugin_name, None)
-            return LaunchResult(1, "launched")
-        store.dispatch_filtered_task(run_id, node_index, plugin_name)
-        return LaunchResult(0, "filtered")
-
-    is_gate_rejected = False
-    if not edge_filters:
-        # Iterate per-dep to match the edge-filter path's behavior — passing
-        # all deps at once mixes BFS branches and can skip passthrough
-        # traversal when one dep has artifacts and another is passthrough-empty.
-        all_artifacts: list[DagArtifact] = []
-        for dep_idx in dependency_indices:
-            dep_arts = collect_upstream_artifacts_bfs(
-                store,
-                run_id,
-                [dep_idx],
-                deps,
-                passthrough_indices=passthrough_indices,
-            )
-            all_artifacts.extend(dep_arts)
-        artifacts = all_artifacts
+    if not isinstance(launch, NodeLaunch):
+        raise StoreContractError("launch creation did not return a NodeLaunch")
+    expected_disposition = NodeDisposition.LAUNCHED if plans else zero_disposition
+    mismatches: list[str] = []
+    if launch.run_id != run_id:
+        mismatches.append("run_id")
+    if launch.node_index != node_index:
+        mismatches.append("node_index")
+    if launch.plugin_name != plugin_name:
+        mismatches.append("plugin_name")
+    if launch.generation != generation:
+        mismatches.append("generation")
+    if launch.disposition != expected_disposition:
+        mismatches.append("disposition")
+    if len(launch.task_ids) != len(plans):
+        mismatches.append("task_ids")
+    elif any(not task_id for task_id in launch.task_ids):
+        mismatches.append("empty task_id")
+    elif len(set(launch.task_ids)) != len(launch.task_ids):
+        mismatches.append("duplicate task_ids")
+    if launch.disposition == NodeDisposition.LAUNCHED:
+        if not launch.task_ids:
+            mismatches.append("launched without tasks")
+        if status == LaunchCreateStatus.CREATED and launch.complete:
+            mismatches.append("new task launch is complete")
     else:
-        artifacts, is_gate_rejected = _collect_and_filter_per_edge(
-            store,
-            run_id,
-            dependency_indices,
-            deps,
-            edge_filters,
-            passthrough_indices=passthrough_indices,
+        if launch.task_ids:
+            mismatches.append("zero-task disposition with tasks")
+        if not launch.complete:
+            mismatches.append("incomplete zero-task disposition")
+    if launch.disposition == NodeDisposition.FAILED and not launch.error:
+        mismatches.append("failed without error")
+    if mismatches:
+        raise StoreContractError(
+            f"launch creation returned mismatched fields: {', '.join(mismatches)}"
         )
-
-    # Gate rejection: cascading skip for AGGREGATE only. AGGREGATE merges
-    # all edges into one task, so a poisoned edge corrupts the whole input.
-    # GROUPED is intentionally excluded — each origin group is independent,
-    # so a rejected edge only kills its own groups while other edges'
-    # groups proceed normally (scatter-gather partial success).
-    if is_gate_rejected and fan_mode == FanMode.AGGREGATE:
-        store.dispatch_skipped_task(run_id, node_index, plugin_name)
-        logger.info("Node %d skipped (gate rejected on aggregate)", node_index)
-        return LaunchResult(0, "skipped")
-
-    # No artifacts for a node with dependencies — filtered
-    if not artifacts and dependency_indices:
-        store.dispatch_filtered_task(run_id, node_index, plugin_name)
-        logger.info("Node %d filtered (no artifacts available)", node_index)
-        return LaunchResult(0, "filtered")
-
-    task_count = 0
-
-    match fan_mode:
-        case FanMode.SINGLE:
-            # One task per artifact — standard fan-out.
-            if len(artifacts) > MAX_FAN_OUT:
-                error = f"Fan-out limit exceeded: {len(artifacts)} artifacts (max {MAX_FAN_OUT})"
-                logger.error("Node %d %s", node_index, error)
-                return LaunchResult(0, "failed", error)
-            for artifact in artifacts:
-                store.dispatch_task(run_id, node_index, plugin_name, artifact.id)
-                task_count += 1
-
-        case FanMode.AGGREGATE:
-            # One task receives ALL artifacts. Root nodes (no deps) also
-            # dispatch a single task with no input artifact.
-            store.dispatch_task(run_id, node_index, plugin_name, None)
-            task_count = 1
-
-        case FanMode.GROUPED:
-            store.dispatch_task(run_id, node_index, plugin_name, None)
-            task_count = 1
-
-    logger.info("Launched node %d with %d task(s)", node_index, task_count)
-    return LaunchResult(task_count, "launched")
+    return launch
 
 
 def reconcile_run(
@@ -368,120 +138,127 @@ def reconcile_run(
     run_id: str,
     *,
     callbacks: OrchestratorCallbacks,
-    resolve_passthrough: ResolvePassthrough,
 ) -> None:
-    """Launch every node whose dependencies are now satisfied.
+    """Launches are created for nodes whose source launches have finished.
 
-    Readiness is computed against persisted state, so callers don't need
-    to tell the engine which node just changed. Safe to call after any
-    state mutation (task completion, retry, manual intervention) and safe
-    to call redundantly — node-launch claims are atomic. No-op on terminal
-    runs.
-
-    Can trigger ``on_run_completed`` (all nodes done) or ``on_run_failed``
-    (fan-out limit exceeded or similar fatal error during launch).
+    The function may follow any committed state change and may be called
+    repeatedly. Terminal runs and nodes with active launches require no further
+    work. Stale snapshots are retried up to ``MAX_SNAPSHOT_RETRIES``. A
+    completed launch without tasks may make another graph level ready during
+    the same call; a task-bearing launch becomes complete after a worker event.
     """
-    run_status = store.get_run_status(run_id)
-    if run_status in RUN_TERMINAL_STATUSES:
-        logger.info("Run %s is %s, skipping orchestration", run_id, run_status)
-        return
 
+    status = store.get_run_status(run_id)
+    if status is None or status in RUN_TERMINAL_STATUSES:
+        return
     nodes = store.get_run_nodes(run_id)
     if nodes is None:
-        logger.error("Run %s pipeline not found", run_id)
+        logger.error("run %s has no snapshotted node definition", run_id)
         return
-    topology = RunTopology.build(nodes, resolve_passthrough)
-
-    completed_nodes = store.get_completed_node_indices(run_id)
-    launched_nodes = store.get_launched_node_indices(run_id)
-    node_completion_map = store.get_node_summary(run_id)
-
-    total_new_tasks = 0
-    all_launched = set(launched_nodes)
-    ready_node_indices: list[int] = []
-    # First iteration scans the whole graph — a parent may have completed
-    # in an earlier turn (e.g. before a retry), so children-of-recent-change
-    # is not a complete frontier. Subsequent iterations narrow to nodes
-    # whose state we just changed (skip/filter cascade).
-    changed_indices: set[int] | None = None
+    topology = RunTopology.build(nodes)
 
     while True:
-        ready = find_ready_nodes(
-            topology.deps,
-            completed_nodes,
-            all_launched,
-            children=topology.children,
-            changed_indices=changed_indices,
+        launches = dict(store.list_node_launches(run_id))
+        failed_launch = min(
+            (
+                launch
+                for launch in launches.values()
+                if launch.disposition == NodeDisposition.FAILED
+            ),
+            key=lambda launch: launch.node_index,
+            default=None,
         )
+        if failed_launch is not None:
+            _terminal_failure(
+                store,
+                run_id=run_id,
+                status=RunStatus.FAILED,
+                error=failed_launch.error or "node planning failed",
+                callbacks=callbacks,
+            )
+            return
+
+        completed = {index for index, launch in launches.items() if launch.complete}
+        launched = set(launches)
+        ready = find_ready_nodes(topology.dependencies, completed, launched)
         if not ready:
             break
 
-        changed_indices = set()
-
-        for node_idx in ready:
-            if not store.try_claim_node_launch(run_id, node_idx):
-                logger.info("Node %d claimed by another worker, skipping", node_idx)
-                all_launched.add(node_idx)
-                continue
-
-            result = _launch_node(
-                store,
-                run_id=run_id,
-                node_index=node_idx,
-                topology=topology,
-                node_completion_map=node_completion_map,
-            )
-            total_new_tasks += result.tasks_created
-            all_launched.add(node_idx)
-            ready_node_indices.append(node_idx)
-
-            if result.disposition == "failed":
-                # Fan-out limit exceeded or similar fatal error — insert a
-                # pre-failed marker task atomically (no queue job) so the
-                # error is visible in the UI without a dispatch→fail race.
-                store.dispatch_failed_task(
-                    run_id, node_idx, topology.nodes[node_idx].plugin, result.error
+        created_complete_launch = False
+        for node_index in ready:
+            node = topology.nodes[node_index]
+            source_indices = {edge.name: topology.slug_to_index[edge.source] for edge in node.edges}
+            launch = None
+            for _attempt in range(MAX_SNAPSHOT_RETRIES):
+                snapshot = store.get_planning_snapshot(run_id, node_index, node.edges)
+                construction = construct_task_plans(
+                    node, source_indices=source_indices, snapshot=snapshot
                 )
-                store.set_run_progress(run_id, len(completed_nodes))
-                if store.try_claim_run_terminal(run_id, RunStatus.FAILED, result.error):
-                    callbacks.on_run_failed(run_id)
-                    store.cancel_remaining_tasks(run_id, f"Cancelled: {result.error}")
-                logger.error(
-                    "Run %s failed at node %d: %s", run_id, node_idx, result.error
+                zero_disposition = None if construction.plans else construction.disposition
+                result = store.try_create_node_launch(
+                    run_id,
+                    node_index,
+                    node.plugin,
+                    snapshot.token,
+                    construction.plans,
+                    zero_disposition,
+                    construction.error,
+                )
+                if result.status == LaunchCreateStatus.STALE:
+                    continue
+                if (
+                    result.status == LaunchCreateStatus.ALREADY_EXISTS
+                    and result.launch is not None
+                    and result.launch.generation != snapshot.generation
+                ):
+                    continue
+                launch = _validate_launch_result(
+                    status=result.status,
+                    run_id=run_id,
+                    node_index=node_index,
+                    plugin_name=node.plugin,
+                    generation=snapshot.generation,
+                    plans=construction.plans,
+                    zero_disposition=zero_disposition,
+                    launch=result.launch,
+                )
+                break
+
+            if launch is None:
+                logger.info(
+                    "planning for run %s node %d was deferred after %d stale snapshots",
+                    run_id,
+                    node_index,
+                    MAX_SNAPSHOT_RETRIES,
+                )
+                continue
+            if launch.disposition == NodeDisposition.FAILED:
+                _terminal_failure(
+                    store,
+                    run_id=run_id,
+                    status=RunStatus.FAILED,
+                    error=launch.error or "node planning failed",
+                    callbacks=callbacks,
                 )
                 return
+            if launch.complete:
+                created_complete_launch = True
 
-            if result.tasks_created == 0:
-                completed_nodes.add(node_idx)
-                node_completion_map[node_idx] = (
-                    NodeSummaryStatus.SKIPPED
-                    if result.disposition == "skipped"
-                    else NodeSummaryStatus.COMPLETED
-                )
-                changed_indices.add(node_idx)
+        # A complete launch can make the next graph level ready. This includes
+        # launches without tasks and launches completed concurrently.
+        refreshed = dict(store.list_node_launches(run_id))
+        new_indices = set(refreshed) - launched
+        if not new_indices or not created_complete_launch:
+            break
 
-    if len(completed_nodes) >= len(topology.nodes):
-        store.set_run_progress(run_id, len(completed_nodes))
-        if not store.try_claim_run_terminal(run_id, RunStatus.COMPLETED):
-            logger.info("Run %s already terminal, skipping completion", run_id)
-            return
+    launches = dict(store.list_node_launches(run_id))
+    completed_count = sum(launch.complete for launch in launches.values())
+    if (
+        len(launches) == len(nodes)
+        and completed_count == len(nodes)
+        and store.try_finalize_run(run_id, RunStatus.COMPLETED, None)
+    ):
         callbacks.on_run_completed(run_id)
-        logger.info("Run %s completed", run_id)
-        return
-
-    if not ready_node_indices:
-        return
-
-    # Track completed node count — not max(launched) which conflates
-    # node index with progress and misleads when indices aren't topological.
-    store.set_run_progress(run_id, len(completed_nodes))
-    logger.info(
-        "Run %s: launched %d node(s) %s with %d total task(s)",
-        run_id,
-        len(ready_node_indices),
-        ready_node_indices,
-        total_new_tasks,
-    )
 
 
 def on_task_complete(
@@ -489,88 +266,72 @@ def on_task_complete(
     *,
     task_id: str,
     callbacks: OrchestratorCallbacks,
-    resolve_passthrough: ResolvePassthrough,
 ) -> None:
-    """Handle task completion: wait for the sibling barrier, then reconcile.
+    """Reconciliation follows committed task completion and output publication."""
 
-    Multiple sibling tasks at the same node finish independently; only the
-    final one triggers downstream launches. Once the barrier is met, the
-    actual readiness/launch work is delegated to ``reconcile_run``.
-    """
-    ctx = store.get_task_context(task_id)
-    if not ctx:
-        logger.error("Task %s not found", task_id)
+    context = store.get_task_context(task_id)
+    if context is None:
+        logger.error("task %s not found", task_id)
         return
-
-    run_id = ctx.run_id
-    node_index = ctx.node_index
-
-    run_status, total_tasks, completed_tasks = store.get_barrier_state(
-        run_id, node_index
-    )
-    if run_status in RUN_TERMINAL_STATUSES:
-        logger.info("Run %s is %s, skipping orchestration", run_id, run_status)
-        return
-
-    if completed_tasks < total_tasks:
-        logger.info(
-            "Node %d: %d/%d tasks done, waiting for siblings",
-            node_index,
-            completed_tasks,
-            total_tasks,
-        )
-        return
-
-    reconcile_run(
-        store,
-        run_id,
-        callbacks=callbacks,
-        resolve_passthrough=resolve_passthrough,
-    )
+    reconcile_run(store, context.run_id, callbacks=callbacks)
 
 
 def on_task_failed(
     store: DagStore,
     *,
     task_id: str,
+    expected_attempt_id: str,
     error_message: str,
     callbacks: OrchestratorCallbacks,
 ) -> None:
-    """Handle task failure. Marks the run as failed and cancels siblings."""
-    run_id = store.mark_task_failed(task_id, error_message)
-    if not run_id:
-        return
+    """A current matching attempt is marked ``FAILED`` before a run transition is attempted."""
 
-    store.set_run_progress(run_id, len(store.get_completed_node_indices(run_id)))
-    if not store.try_claim_run_terminal(run_id, RunStatus.FAILED, error_message):
-        logger.info("Run %s already terminal, skipping failure handling", run_id)
-        return
-
-    callbacks.on_run_failed(run_id)
-    store.cancel_remaining_tasks(run_id, "Cancelled: sibling task failed")
-    logger.info("Run %s failed due to task %s: %s", run_id, task_id, error_message)
+    run_id = store.mark_task_failed(
+        task_id,
+        error_message,
+        expected_attempt_id=expected_attempt_id,
+    )
+    if run_id is not None:
+        _terminal_failure(
+            store,
+            run_id=run_id,
+            status=RunStatus.FAILED,
+            error=error_message,
+            callbacks=callbacks,
+            cause=TaskAttemptRef(
+                task_id=task_id,
+                attempt_id=expected_attempt_id,
+            ),
+        )
 
 
 def on_task_crashed(
     store: DagStore,
     *,
     task_id: str,
+    expected_attempt_id: str,
     error_message: str,
     callbacks: OrchestratorCallbacks,
 ) -> None:
-    """Handle infra failure. Marks run as crashed — not billed."""
-    run_id = store.mark_task_crashed(task_id, error_message)
-    if not run_id:
-        return
+    """A current matching attempt is marked ``CRASHED`` before a run transition is attempted."""
 
-    store.set_run_progress(run_id, len(store.get_completed_node_indices(run_id)))
-    if not store.try_claim_run_terminal(run_id, RunStatus.CRASHED, error_message):
-        logger.info("Run %s already terminal, skipping crash handling", run_id)
-        return
-
-    callbacks.on_run_crashed(run_id)
-    store.cancel_remaining_tasks(run_id, "Cancelled: worker crashed")
-    logger.info("Run %s crashed due to task %s: %s", run_id, task_id, error_message)
+    run_id = store.mark_task_crashed(
+        task_id,
+        error_message,
+        expected_attempt_id=expected_attempt_id,
+    )
+    if run_id is not None:
+        _terminal_failure(
+            store,
+            run_id=run_id,
+            status=RunStatus.CRASHED,
+            error=error_message,
+            callbacks=callbacks,
+            cause=TaskAttemptRef(
+                task_id=task_id,
+                attempt_id=expected_attempt_id,
+            ),
+        )
 
 
 def abort_run(
@@ -581,30 +342,14 @@ def abort_run(
     callbacks: OrchestratorCallbacks,
     status: RunStatus = RunStatus.FAILED,
 ) -> bool:
-    """Terminate a run externally (deadline, cancellation, admin kill).
+    """The function attempts a ``FAILED``, ``CRASHED`` or ``CANCELLED`` transition."""
 
-    Run-level counterpart to on_task_failed / on_task_crashed. Use when
-    no single task triggered the termination. For task-level timeouts,
-    use on_task_failed instead.
-    """
     if status not in (RunStatus.FAILED, RunStatus.CRASHED, RunStatus.CANCELLED):
-        raise ValueError(
-            f"abort_run status must be FAILED, CRASHED, or CANCELLED, got {status}"
-        )
-
-    store.set_run_progress(run_id, len(store.get_completed_node_indices(run_id)))
-    if not store.try_claim_run_terminal(run_id, status, reason):
-        logger.info("Run %s already terminal, skipping abort", run_id)
-        return False
-
-    match status:
-        case RunStatus.CRASHED:
-            callbacks.on_run_crashed(run_id)
-        case RunStatus.CANCELLED:
-            callbacks.on_run_cancelled(run_id)
-        case _:
-            callbacks.on_run_failed(run_id)
-
-    store.cancel_remaining_tasks(run_id, f"Cancelled: {reason}")
-    logger.info("Run %s aborted (%s): %s", run_id, status.value, reason)
-    return True
+        raise ValueError(f"invalid abort status {status!r}")
+    return _terminal_failure(
+        store,
+        run_id=run_id,
+        status=status,
+        error=reason,
+        callbacks=callbacks,
+    )

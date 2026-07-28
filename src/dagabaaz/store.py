@@ -1,311 +1,233 @@
-"""Storage protocol for the DAG execution engine.
+"""Protocols for persistence and output resolution."""
 
-Defines the interface the engine needs for persistence and job dispatch.
-"""
+from __future__ import annotations
 
-from typing import TYPE_CHECKING, Protocol, runtime_checkable
+from collections.abc import Mapping
+from dataclasses import dataclass
+from types import MappingProxyType
+from typing import Protocol, runtime_checkable
 
-from dagabaaz.constants import NodeSummaryStatus, RunStatus
-from dagabaaz.models import DagArtifact, DagNode, TaskArtifact, TaskContext
+from dagabaaz.constants import RUN_TERMINAL_STATUSES, RunStatus
+from dagabaaz.models import (
+    DagNode,
+    InputEdge,
+    LaunchCreateResult,
+    NodeDisposition,
+    NodeLaunch,
+    PlanningSnapshot,
+    ResolvedOutput,
+    TaskContext,
+    TaskInputPlan,
+)
 
-if TYPE_CHECKING:
-    from dagabaaz.retry import RetryableTaskInfo
+
+class StoreContractError(RuntimeError):
+    """A store returned state that does not match the requested operation."""
+
+
+@dataclass(frozen=True, slots=True)
+class TaskAttemptRef:
+    """The task attempt associated with a requested terminal transition."""
+
+    task_id: str
+    attempt_id: str
+
+    def __post_init__(self) -> None:
+        if not self.task_id or not self.attempt_id:
+            raise ValueError("task and attempt IDs must not be empty")
+
+
+@dataclass(frozen=True, slots=True)
+class RunReopenResult:
+    """The retry count and plan generations committed when a run is reopened."""
+
+    retry_count: int
+    generations: Mapping[int, int]
+
+    def __post_init__(self) -> None:
+        if type(self.retry_count) is not int or self.retry_count < 1:
+            raise ValueError("retry_count must be a positive integer")
+        if not isinstance(self.generations, Mapping):
+            raise ValueError("run generations must be a mapping")
+        copied: dict[int, int] = {}
+        for index, generation in self.generations.items():
+            if type(index) is not int or type(generation) is not int:
+                raise ValueError("node indices and generations must be integers")
+            copied[index] = generation
+        if any(index < 0 or generation < 1 for index, generation in copied.items()):
+            raise ValueError("node indices must be non-negative and generations must be positive")
+        object.__setattr__(self, "generations", MappingProxyType(copied))
 
 
 @runtime_checkable
 class DagStore(Protocol):
-    """Storage and dispatch interface for the DAG execution engine.
+    """Persistence operations used by the orchestrator.
 
-    Methods are grouped by concern: run state, task queries,
-    task dispatch, and artifact queries.
-
-    **Concurrency contract**: Callers must serialize ``on_task_complete``
-    per run (e.g. via ``pg_advisory_xact_lock``) so that barrier sync
-    reads see committed state from prior completions.
+    Planning validates snapshot contents before launch creation. In one
+    transaction, the store validates the snapshot token and run state, then
+    writes the launch. The application's worker adapter commits task completion
+    and output publication together. Published routing fields remain unchanged.
     """
 
     def get_run_status(self, run_id: str) -> RunStatus | None:
-        """Return the run's current lifecycle status, or None if not found."""
-        ...
-
-    def get_barrier_state(
-        self, run_id: str, node_index: int
-    ) -> tuple[RunStatus | None, int, int]:
-        """Return (run_status, total_tasks, completed_tasks) in one round-trip.
-
-        Combines the run-status terminal check and the barrier-sync task
-        count into a single call.
-        """
+        """The run status is returned, or ``None`` when the run does not exist."""
         ...
 
     def get_run_nodes(self, run_id: str) -> list[DagNode] | None:
-        """Return the snapshotted node definitions for a run, or None if not found.
+        """A copy of the run's stored node definitions is returned.
 
-        Extra fields beyond DagNode (config, credentials) are silently ignored.
+        The stored topology must not change during a run. Boundary retries use
+        the same definitions rather than the pipeline's current definition.
         """
         ...
 
-    def try_claim_run_terminal(
-        self, run_id: str, status: RunStatus, error: str | None = None
-    ) -> bool:
-        """Atomically transition a run to a terminal status.
+    def list_node_launches(self, run_id: str) -> Mapping[int, NodeLaunch]:
+        """Launches that have not been invalidated are keyed by node index."""
+        ...
 
-        Returns True if the transition succeeded, False if the run was
-        already in a terminal state. Must be atomic — if two callers
-        race (e.g., one completing, one failing), exactly one wins.
+    def get_planning_snapshot(
+        self,
+        run_id: str,
+        node_index: int,
+        edges: tuple[InputEdge, ...],
+    ) -> PlanningSnapshot:
+        """A planning snapshot represents one consistent source state.
+
+        The snapshot contains the exact named-edge sets, source dispositions,
+        generation and frozen run input. Its token must become stale when source
+        state changes. Skipped, filtered and failed source launches expose no
+        outputs.
         """
         ...
 
-    def set_run_progress(self, run_id: str, completed_count: int) -> None:
-        """Update the run's progress to the count of completed nodes.
+    def try_create_node_launch(
+        self,
+        run_id: str,
+        node_index: int,
+        plugin_name: str,
+        snapshot_token: str,
+        plans: tuple[TaskInputPlan, ...],
+        zero_task_disposition: NodeDisposition | None,
+        error: str = "",
+    ) -> LaunchCreateResult:
+        """A node launch is created if the snapshot and run are still current.
 
-        Called in two patterns. Running-state calls happen at the end of
-        reconcile ticks that advanced completion; the value is advisory
-        and may lag reality by one tick. Terminal-state calls happen
-        immediately before ``try_claim_run_terminal`` on every terminal
-        transition; consumers reading progress from inside any terminal
-        callback see the value written by that call.
-
-        Implementations that recompute progress on read may pass – the
-        advisory writes become noise and the terminal write becomes
-        redundant. Implementations that need atomic terminal+progress
-        can share a transaction with ``try_claim_run_terminal``; the
-        orchestrator's call ordering supports this but does not require
-        it.
+        Validation of the token and run state, launch creation, task and plan
+        persistence, and queue outbox writes occur in one transaction. A
+        disposition without tasks creates no task rows. ``STALE`` takes
+        precedence when an existing launch belongs to another generation;
+        ``ALREADY_EXISTS`` is reserved for the generation represented by the
+        snapshot token.
         """
         ...
 
     def get_task_context(self, task_id: str) -> TaskContext | None:
-        """Return the run_id and node_index for a task, or None if not found."""
+        """The task's routing context is returned, or ``None`` when unavailable."""
         ...
 
-    def get_completed_node_indices(self, run_id: str) -> set[int]:
-        """Return indices of nodes where ALL tasks are terminal.
-
-        A node is complete when every task has reached a terminal state
-        (completed, skipped, or filtered).
-        """
-        ...
-
-    def get_launched_node_indices(self, run_id: str) -> set[int]:
-        """Return indices of nodes that have at least one task."""
-        ...
-
-    def get_node_summary(self, run_id: str) -> dict[int, NodeSummaryStatus]:
-        """Return per-node aggregate status for skip cascade decisions.
-
-        Maps node_index to one of:
-        - ``"completed"``: all tasks finished (completed, filtered, or mixed)
-        - ``"skipped"``:   ALL tasks are skipped (upstream dead — cascading)
-        - ``"partial"``:   some tasks still pending/running/failed
-
-        The orchestrator uses ``"skipped"`` to propagate skip cascades:
-        if any dependency is fully skipped, the downstream node is also
-        skipped without executing. Filtered nodes (edge filter produced 0
-        artifacts) map to ``"completed"`` and do NOT cascade.
-        """
-        ...
-
-    def try_claim_node_launch(self, run_id: str, node_index: int) -> bool:
-        """Attempt to claim exclusive right to launch a node.
-
-        Returns True if this caller claimed the node, False if another
-        caller already claimed it. Must be atomic — exactly one caller
-        wins when called concurrently for the same (run_id, node_index).
-        """
-        ...
-
-    def dispatch_task(
+    def mark_task_failed(
         self,
-        run_id: str,
-        node_index: int,
-        plugin_name: str,
-        input_artifact_id: str | None,
-    ) -> str:
-        """Create and enqueue a task for execution. Returns the task ID.
-
-        Called during fan-out (one call per artifact) or for fan-in/root
-        nodes (one call with input_artifact_id=None).
-
-        **Async dispatch contract**: The dispatched task MUST NOT complete
-        before this method returns. The orchestrator's launch loop assumes
-        dispatched tasks are pending/queued, not completed.
-        """
-        ...
-
-    def dispatch_skipped_task(
-        self,
-        run_id: str,
-        node_index: int,
-        plugin_name: str,
-    ) -> str:
-        """Insert a pre-marked 'skipped' task (no queue job). Returns the task ID.
-
-        The marker row lets dependency resolution count this node as
-        satisfied and skip cascades propagate to downstream nodes.
-        """
-        ...
-
-    def dispatch_filtered_task(
-        self,
-        run_id: str,
-        node_index: int,
-        plugin_name: str,
-    ) -> str:
-        """Insert a pre-marked 'filtered' task (no queue job). Returns the task ID.
-
-        Unlike skipped, filtered does NOT cascade -- downstream nodes
-        proceed normally, collecting artifacts from further upstream.
-        """
-        ...
-
-    def dispatch_failed_task(
-        self,
-        run_id: str,
-        node_index: int,
-        plugin_name: str,
+        task_id: str,
         error: str,
-    ) -> str:
-        """Insert a pre-marked 'failed' task with error (no queue job). Returns the task ID.
+        *,
+        expected_attempt_id: str,
+    ) -> str | None:
+        """The current task attempt moves to ``FAILED`` and yields its run ID.
 
-        Atomic alternative to dispatch_task + mark_task_failed, which has a
-        race window where a worker could pick up the dispatched task before
-        the failure mark lands.
+        The attempt comparison and state change share a transaction. Stale,
+        missing, invalidated or terminal tasks return ``None`` without a change.
         """
         ...
 
-    def mark_task_failed(self, task_id: str, error: str) -> str | None:
-        """Mark a task as failed. Returns the run_id, or None if not found."""
-        ...
+    def mark_task_crashed(
+        self,
+        task_id: str,
+        error: str,
+        *,
+        expected_attempt_id: str,
+    ) -> str | None:
+        """The current task attempt moves to ``CRASHED`` and yields its run ID.
 
-    def mark_task_crashed(self, task_id: str, error: str) -> str | None:
-        """Mark a task as crashed (infra failure). Returns the run_id, or None if not found.
-
-        Distinct from ``mark_task_failed``: crashed = infrastructure failure,
-        failed = plugin/execution error.
+        The attempt comparison and state change share a transaction. Stale,
+        missing, invalidated or terminal tasks return ``None`` without a change.
         """
         ...
 
-    def cancel_remaining_tasks(self, run_id: str, reason: str) -> int:
-        """Cancel all non-terminal tasks for a run. Returns the count.
-
-        Uses "not terminal" rather than "active" so new statuses are
-        automatically covered.
-        """
-        ...
-
-    def dispatch_grouped_task(
+    def try_finalize_run(
         self,
         run_id: str,
-        node_index: int,
-        plugin_name: str,
-        origin_artifact_id: str,
-    ) -> str:
-        """Create a task for one origin group in grouped fan-in. Returns the task ID.
+        status: RunStatus,
+        error: str | None,
+        *,
+        cause: TaskAttemptRef | None = None,
+    ) -> bool:
+        """The terminal transition is validated and applied in one transaction.
 
-        Stores ``origin_artifact_id`` on the task instead of
-        ``input_artifact_id``.
+        When ``cause`` is present, its task attempt must still be current in its
+        active launch. Completion requires active launch keys for every stored
+        node index, complete active launches, no failed active launch and
+        successful completion of every task owned by those launches.
+        Invalidated launches, tasks and attempt history do not count. Other
+        terminal transitions cancel unfinished active work. Validation,
+        cancellation, progress and the status change share a transaction.
+        Missing and terminal runs return ``False`` without a change.
         """
-        ...
-
-    def get_artifacts_by_node_indices(
-        self,
-        run_id: str,
-        node_indices: list[int],
-    ) -> list[DagArtifact]:
-        """Fetch artifacts produced by tasks at the given node indices."""
+        if status not in RUN_TERMINAL_STATUSES:
+            raise ValueError(f"status {status!r} is not terminal")
         ...
 
 
 @runtime_checkable
-class TaskInputStore(Protocol):
-    """Storage interface for worker-side task input resolution.
+class OutputResolver(Protocol):
+    def resolve_outputs(
+        self, run_id: str, output_ids: tuple[str, ...]
+    ) -> Mapping[str, ResolvedOutput]:
+        """The requested output IDs are resolved within the given run.
 
-    Separate from ``DagStore`` -- users who only need orchestration
-    don't implement this.
-    """
-
-    def get_artifact_data(self, artifact_id: str) -> TaskArtifact | None:
-        """Fetch a single artifact by ID with file path."""
-        ...
-
-    def get_task_artifacts_by_node_indices(
-        self,
-        run_id: str,
-        node_indices: list[int],
-    ) -> list[TaskArtifact]:
-        """Fetch artifacts (with file_path) produced by tasks at the given node indices."""
-        ...
-
-    def get_grouped_artifacts(
-        self,
-        run_id: str,
-        dep_indices: list[int],
-        origin_id: str,
-    ) -> list[TaskArtifact]:
-        """Fetch artifacts sharing a specific origin from dependency nodes."""
-        ...
-
-    def get_broadcast_artifacts(
-        self,
-        run_id: str,
-        dep_indices: list[int],
-    ) -> list[TaskArtifact]:
-        """Fetch artifacts with NULL origin (broadcast/side inputs)."""
-        ...
-
-    def get_run_input(self, run_id: str) -> dict[str, object]:
-        """Fetch the run's user-provided input."""
-        ...
-
-    def get_artifacts_partitioned(
-        self,
-        run_id: str,
-        node_indices: list[int],
-    ) -> dict[int, list[TaskArtifact]]:
-        """Fetch artifacts from nodes, partitioned by producing node index."""
-        ...
-
-    def get_artifact_producing_node(self, artifact_id: str) -> int | None:
-        """Return the node_index of the task that produced a given artifact."""
+        The mapping contains every requested ID and no others, keyed by output
+        ID. Each ``fields`` mapping must match the routing fields published for
+        that output. Data may contain ordinary values, paths, URIs or durable
+        references that remain valid throughout task execution. Resolved data
+        must not contain live handles, cursors or other resource-owning objects;
+        the worker adapter acquires and cleans up such resources separately.
+        """
         ...
 
 
 @runtime_checkable
 class DagRetryStore(DagStore, Protocol):
-    """Extended DagStore with retry capabilities.
+    def try_create_task_retry(
+        self, task_id: str, *, expected_attempt_id: str
+    ) -> str | None:
+        """A replacement is created only for a current crashed attempt on an active run.
 
-    Separated from ``DagStore`` so existing implementations don't need
-    to implement retry methods.
-    """
-
-    def delete_node_launches(self, run_id: str, node_indices: list[int]) -> None:
-        """Delete node_launches entries for given nodes.
-
-        Clears the atomic claim so re-dispatch can re-claim them.
+        The transaction compares ``expected_attempt_id``, retains the task plan
+        and generation, and creates the replacement attempt and queue outbox
+        row. Success returns the replacement attempt ID. Rejection returns
+        ``None`` without changing state.
         """
         ...
 
-    def delete_tasks_at_nodes(self, run_id: str, node_indices: list[int]) -> None:
-        """Delete all tasks at given nodes (downstream wipe on retry)."""
-        ...
+    def try_reopen_run(
+        self,
+        run_id: str,
+        boundary_indices: tuple[int, ...] | None,
+        affected_indices: tuple[int, ...],
+    ) -> RunReopenResult | None:
+        """The run is reopened only if the supplied retry state remains current.
 
-    def get_retryable_tasks(
-        self, run_id: str, node_indices: list[int]
-    ) -> list["RetryableTaskInfo"]:
-        """Get non-completed tasks at given nodes for retry re-dispatch.
+        The store acquires its run lock before reading status, topology,
+        launches, tasks or generations. A failed or crashed run requires a
+        non-empty active failure boundary. A cancelled run requires ``None``.
+        The store adds every incomplete or failed active launch to the restart
+        roots, recomputes their downstream closure and requires it to equal
+        ``affected_indices``.
 
-        Returns minimal task info needed to decide how to re-dispatch
-        (grouped vs fan-out) and to build the replacement map.
-        """
-        ...
-
-    def delete_non_completed_tasks_at_nodes(
-        self, run_id: str, node_indices: list[int]
-    ) -> None:
-        """Delete non-completed tasks at given nodes (failed node cleanup).
-
-        Completed tasks at these nodes are preserved — only pending,
-        queued, running, failed, crashed, cancelled tasks are removed.
+        Reopening, retry-count increment, generation changes and invalidation
+        share that transaction. All planning snapshots obtained before the
+        retry become stale. Success returns the written retry count and every
+        affected generation. A cancelled run with no affected nodes returns an
+        empty generation mapping. Rejection returns ``None`` without changing
+        state.
         """
         ...
