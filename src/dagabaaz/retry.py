@@ -27,11 +27,11 @@ def retry_task(
     *,
     expected_attempt_id: str,
 ) -> str | None:
-    """A current crashed attempt may be replaced while its run remains active.
+    """Replace a crashed attempt without changing its planned work.
 
-    The store creates a replacement only if ``expected_attempt_id`` is still
-    current, and reuses the task's plan and generation. Success also creates the
-    replacement queue outbox row; rejection returns ``None``.
+    The expected ID prevents an old retry from replacing newer work. The
+    replacement keeps its wait correlation so it can load the same application
+    response. Its attempt and outbox row must commit together.
     """
 
     return store.try_create_task_retry(task_id, expected_attempt_id=expected_attempt_id)

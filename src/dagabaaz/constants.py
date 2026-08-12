@@ -15,14 +15,12 @@ class RunStatus(StrEnum):
 
 
 class TaskStatus(StrEnum):
-    """Lifecycle states for task attempts.
-
-    Node outcomes such as skipped or filtered belong to ``NodeDisposition``.
-    """
+    """A logical task's state, independent of the attempt executing it."""
 
     PENDING = "pending"
     QUEUED = "queued"
     RUNNING = "running"
+    WAITING = "waiting"
     COMPLETED = "completed"
     FAILED = "failed"
     CRASHED = "crashed"
@@ -137,6 +135,7 @@ MAX_LAUNCH_BINDING_EVALUATED_BYTES = 16 * 1024 * 1024
 MAX_FILTER_RULES_PER_EDGE = 64
 MAX_FILTER_MEMBERSHIP_VALUES = 256
 MAX_OUTPUT_ID_LENGTH = 512
+MAX_WAIT_ID_LENGTH = 512
 # Snapshot readers return at most each limit plus one output. The extra output
 # only proves that planning must reject the snapshot.
 MAX_SNAPSHOT_OUTPUTS_PER_EDGE = 10_000

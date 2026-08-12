@@ -1,6 +1,6 @@
 # dagabaaz
 
-A Python library that orchestrates multi-step workflows as directed acyclic graphs. You define the steps and their dependencies; the engine handles scheduling, data routing, and failures.
+A Python library that orchestrates multi-step workflows as directed acyclic graphs. You define the steps and their dependencies; the engine handles scheduling, data routing and failures.
 
 ```shell
 pip install dagabaaz
@@ -83,6 +83,22 @@ class AppStore:
         error="",
     ): ...
 
+    def try_claim_task(
+        self,
+        task_id,
+        *,
+        expected_attempt_id,
+        expected_generation,
+    ): ...
+
+    def try_recover_task(
+        self,
+        task_id,
+        *,
+        expected_attempt_id,
+        expected_generation,
+    ): ...
+
     def try_complete_task(
         self,
         task_id,
@@ -103,6 +119,8 @@ class AppStore:
 
 Each edge and the combined snapshot may contain one output beyond the supplied count limit to signal overflow. Snapshot loading also stops after the first output that exceeds the routing-byte limit. `try_create_node_launch` checks the snapshot token and writes the node launch, tasks, plans and queue outbox entries in one transaction. `try_complete_task` rejects a first publication above the output-count or routing-byte limit before it writes the task status, outputs, launch state and progress. Materialised data is outside this byte limit. The store protocol is in [`store.py`](src/dagabaaz/store.py).
 
+Claim and recovery belong to `DagStore` because every store dispatches work and accepts its result. Waiting remains optional through `DagWaitStore`. A replacement attempt and its queue outbox row must commit together; otherwise a task could be marked `QUEUED` with nothing to run.
+
 ## Run lifecycle
 
 The application stores the run and its node definitions before it calls `start_run`. Node definitions must remain unchanged after the run record is created. Start requests must be delivered at least once, or the application must reconcile running runs after a process failure.
@@ -120,9 +138,100 @@ callbacks = OrchestratorCallbacks(
 start_run(store, "run-1", callbacks=callbacks)
 ```
 
-A worker adapter first checks the queued attempt ID and plan generation. It then passes the attempt ID and a tuple of `EmittedOutput` objects to `on_task_complete`. The store commits the task and its outputs before Dagabaaz checks whether another node is ready. The attempt ID is the completion idempotency key, so a repeated callback cannot replace committed outputs. An invalid first output batch fails the task and run.
+Before a worker acts on a queue delivery, it must claim the attempt named in that delivery:
 
-`on_task_failed` and `on_task_crashed` receive the queued attempt ID. The store updates the task only if that attempt is still current. `try_finalize_run` repeats the attempt check before changing the run status, which protects a replacement attempt created by a concurrent retry. The same transaction rejects invalid terminal transitions and cancels unfinished tasks.
+```python
+from dagabaaz.execution import claim_task
+
+claimed = claim_task(
+    store,
+    delivery.task_id,
+    expected_attempt_id=delivery.attempt_id,
+    expected_generation=delivery.generation,
+)
+if claimed is None:
+    return
+```
+
+Only one delivery can claim an attempt. If `claim_task` returns `None`, that delivery must not run. The return value does not say why the claim failed: another worker may own it, the task may have finished or entered `WAITING`, or the delivery may be stale. Use the queue and provider records to decide whether to acknowledge it, leave its owner alone or recover abandoned work.
+
+After claiming, the worker reports completion with the same attempt ID. The store commits the outputs and task state before Dagabaaz looks for newly ready nodes. Repeating a committed callback returns the first result; it cannot replace the outputs. An invalid first output batch fails the task and run.
+
+The first completion, failure or crash callback succeeds only for the attempt that currently owns a `RUNNING` task. This makes callbacks from earlier attempts harmless. An exact repeat after a terminal transition returns the stored result. Run finalisation checks the attempt again so a concurrent retry cannot fail or crash its replacement.
+
+## Waiting and re-entry
+
+The task status describes the logical task. The attempt ID names the execution allowed to change it.
+
+```text
+PENDING --> QUEUED -- claim --> RUNNING -- wait --> WAITING
+              ^                         |                    |
+              |                         |                    |
+              +-- recovery, new attempt +                    |
+              |                                              |
+              +----------- resume, new attempt --------------+
+
+RUNNING --> COMPLETED | FAILED | CRASHED
+
+Any unfinished task may become CANCELLED when its run is finalised.
+```
+
+`WAITING` means unfinished but deliberately not runnable. The task keeps its plan and generation, creates no new queue delivery and cannot be claimed. The delivery that entered the wait may remain leased until the application acknowledges it. Other branches may continue, but dependent nodes remain blocked and the run stays `RUNNING`.
+
+Dagabaaz needs only a key that links the wait to application data. The application keeps the prompt, answer, secret, approval or provider payload. The key must be non-empty, contain no NUL character and be no longer than 512 characters.
+
+```python
+from dagabaaz.waiting import resume_task, wait_task
+
+waited = wait_task(
+    store,
+    task_id,
+    checkpoint_id,
+    expected_attempt_id=attempt_id,
+    expected_generation=generation,
+)
+
+# In the transaction that records the response:
+resumed = resume_task(
+    store,
+    task_id,
+    checkpoint_id,
+    expected_attempt_id=attempt_id,
+    expected_generation=generation,
+)
+```
+
+Resumption uses a new attempt ID so callbacks from the execution that entered the wait are stale. When the new attempt is claimed, `TaskClaimResult.resumed_from_wait_id` tells the worker which application checkpoint to load. Retry and recovery keep this value so replacement attempts load the same response.
+
+A timeout can hide whether a store operation committed. Repeating the same wait, resume or recovery therefore returns its original result without creating another attempt or queue entry. That result remains available after later state changes. Trying to resume a wait that cancellation or replanning has already invalidated returns `None`, and a task never reuses a wait ID.
+
+The result of `resume_task` or `recover_task` records what the store committed; it is not permission to execute. Work starts only when the outbox produces a delivery and that delivery wins `claim_task`.
+
+> Waiting, resumption and recovery start the task again from stored state; they do not continue a suspended Python stack. Earlier work may run again unless the application records it or makes it safe to repeat.
+
+### Recovery safety
+
+An expired queue lease means that the broker may deliver the message again. It does not prove that the old worker stopped; the worker may still be running after losing its heartbeat. Recover an attempt only when at least one of these statements is true:
+
+- The old execution can no longer change anything outside Dagabaaz.
+- The application has confirmed that the worker or provider stopped.
+- The external service rejects a repeated action with the same idempotency key.
+- The application checked the uncertain outcome and knows that retrying is safe.
+
+Otherwise, treat the outcome as uncertain or report a crash instead of recovering the attempt automatically. Dagabaaz rejects late database callbacks from the abandoned attempt, but it cannot prevent a repeated browser action, purchase, message or submission.
+
+### Application transactions
+
+Two separate transactions can disagree after a crash: the application may store a response without resuming the task, or resume the task without storing the response. Where the database and queue allow it, use one transaction for:
+
+- The application checkpoint, `wait_task` and acknowledgement of the current delivery.
+- The application response and `resume_task`, including the replacement outbox row.
+
+The `wait_task` and `resume_task` wrappers do not create this surrounding transaction. They rely on each store method to make its own state and outbox writes atomic. If the resources cannot share a transaction, the application needs a recovery procedure that is safe to repeat. Dagabaaz does not account for worker time or billing.
+
+`QUEUED` promises that a delivery exists or that an outbox row will create one. A queued task with no dispatch work breaks that promise and looks like lost publication. Represent an external wait as `WAITING`, not as a null job ID or an application-only phase.
+
+Every `DagStore` implementation must add claim and recovery before upgrading. `DagWaitStore` remains optional. A wait-capable store must keep resolved and invalidated waits, plus recovery results, because the current task row cannot answer a repeated call after the task changes. Database-backed stores need their own transaction and concurrency tests; the in-memory suite cannot prove database atomicity.
 
 ## Task inputs
 
@@ -172,11 +281,11 @@ Applications may store parent-child output links when they need an execution his
 
 ## Retries
 
-`retry_task` creates another attempt for a crashed task with its existing plan while the run remains active. The caller supplies the current attempt ID so a stale retry cannot replace a later attempt.
+A retry of a resumed attempt must keep `resumed_from_wait_id`; otherwise its replacement cannot find the response that resumed the crashed attempt. The expected attempt ID prevents a stale retry from replacing newer work. A waiting task has not crashed, so it must be resumed or cancelled.
 
 `retry_run` works with failed, crashed and cancelled runs. The store finds unsuccessful launches and their descendants while it holds the run lock. A caller may supply a boundary for a failed or crashed run; the boundary asserts that the listed nodes still contain active failures.
 
-Replanning invalidates a node generation as a unit. Its tasks, plans and outputs are removed even when one task in that generation had succeeded. Invalidated output IDs remain reserved for the lifetime of the run. Completed launches outside the affected closure remain in place. A cancelled run may be reopened before any node has launched.
+Replanning replaces a node generation as a unit. Dagabaaz invalidates its tasks, plans, unresolved waits and outputs, even when one task had succeeded, so a late response cannot revive old work. Results from earlier wait, resume and recovery calls remain available only so callers can recognise a repeated request. Completed launches outside the affected closure remain in place, and invalidated output IDs remain reserved for the life of the run.
 
 The store increments the retry count, advances the affected plan generations, invalidates the affected launches and reopens the run in one transaction. The application must not call `retry_run` and a terminal callback for the same run at the same time. Cleanup and `reconcile_run` may follow only after the retry succeeds.
 

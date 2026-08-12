@@ -2,7 +2,8 @@
 
 The orchestrator plans nodes whose source launches are complete. Stores create
 launches, tasks, plans and queue outbox rows together, so repeated reconciliation
-does not duplicate work.
+does not duplicate work. Only the attempt that owns a ``RUNNING`` task may
+report its first terminal result.
 """
 
 from __future__ import annotations
@@ -334,7 +335,7 @@ def on_task_complete(
     outputs: tuple[EmittedOutput, ...] = (),
     callbacks: OrchestratorCallbacks,
 ) -> None:
-    """Task completion and output publication precede any required reconciliation."""
+    """Ignore stale callbacks and reconcile only after completion commits."""
 
     try:
         result = store.try_complete_task(

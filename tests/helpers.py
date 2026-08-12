@@ -15,6 +15,7 @@ from dagabaaz.constants import (
     RunStatus,
     TaskStatus,
 )
+from dagabaaz.execution import claim_task
 from dagabaaz.graph import (
     build_slug_to_index_map,
     downstream_closure,
@@ -39,11 +40,22 @@ from dagabaaz.store import (
     OutputPublicationError,
     RunReopenResult,
     TaskAttemptRef,
+    TaskClaimResult,
     TaskCompletionResult,
     TaskFailureResult,
+    TaskRecoveryResult,
+    TaskResumeResult,
+    TaskWaitResult,
     validate_output_batch_routing_size,
     validate_output_batch_size,
 )
+
+
+@dataclass
+class _WaitRecord:
+    wait_result: TaskWaitResult
+    state: str = "active"
+    resume_result: TaskResumeResult | None = None
 
 
 class FakeStore:
@@ -67,9 +79,13 @@ class FakeStore:
         self.task_statuses: dict[str, TaskStatus] = {}
         self.current_attempts: dict[str, str] = {}
         self.invalidated_attempts: dict[str, str] = {}
+        self.attempt_wait_ids: dict[str, str | None] = {}
         self.attempt_errors: dict[str, str] = {}
         self.completion_results: dict[str, TaskCompletionResult] = {}
         self.failure_results: dict[str, TaskFailureResult] = {}
+        self.recovery_results: dict[tuple[str, str, int], TaskRecoveryResult] = {}
+        self.waits: dict[tuple[str, str], _WaitRecord] = {}
+        self.active_waits: dict[str, str] = {}
 
         self.queue_payloads: list[dict[str, object]] = []
         self.retry_payloads: list[dict[str, object]] = []
@@ -131,6 +147,7 @@ class FakeStore:
         launch_id: str,
         generation: int,
         retry: bool,
+        resumed_from_wait_id: str | None = None,
     ) -> str:
         self._attempt_counter += 1
         attempt_id = f"attempt-{self._attempt_counter}"
@@ -141,11 +158,17 @@ class FakeStore:
             "launch_id": launch_id,
         }
         self.current_attempts[task_id] = attempt_id
+        self.attempt_wait_ids[attempt_id] = resumed_from_wait_id
         self.queue_payloads.append(payload)
         self.active_deliveries[attempt_id] = payload
         if retry:
             self.retry_payloads.append(payload)
         return attempt_id
+
+    def _invalidate_active_wait(self, task_id: str) -> None:
+        wait_id = self.active_waits.pop(task_id, None)
+        if wait_id is not None:
+            self.waits[(task_id, wait_id)].state = "invalidated"
 
     def get_run_status(self, run_id: str) -> RunStatus | None:
         return self.status if run_id == self.run_id else None
@@ -359,6 +382,214 @@ class FakeStore:
         assert result.launch is not None
         return result.launch
 
+    def try_claim_task(
+        self,
+        task_id: str,
+        *,
+        expected_attempt_id: str,
+        expected_generation: int,
+    ) -> TaskClaimResult | None:
+        context = self.task_contexts.get(task_id)
+        launch = self.launches.get(context.node_index) if context is not None else None
+        plan = self.plans.get(task_id)
+        if (
+            context is None
+            or context.run_id != self.run_id
+            or context.generation != expected_generation
+            or self.generations.get(context.node_index, 0) != expected_generation
+            or launch is None
+            or launch.generation != expected_generation
+            or task_id not in launch.task_ids
+            or plan is None
+            or plan.generation != expected_generation
+            or self.status != RunStatus.RUNNING
+            or self.task_statuses.get(task_id) != TaskStatus.QUEUED
+            or self.current_attempts.get(task_id) != expected_attempt_id
+        ):
+            return None
+
+        self.task_statuses[task_id] = TaskStatus.RUNNING
+        self._bump_revision()
+        return TaskClaimResult(
+            task_id=task_id,
+            attempt_id=expected_attempt_id,
+            run_id=self.run_id,
+            node_index=context.node_index,
+            generation=context.generation,
+            resumed_from_wait_id=self.attempt_wait_ids[expected_attempt_id],
+        )
+
+    def try_recover_task(
+        self,
+        task_id: str,
+        *,
+        expected_attempt_id: str,
+        expected_generation: int,
+    ) -> TaskRecoveryResult | None:
+        recovery_key = (task_id, expected_attempt_id, expected_generation)
+        existing = self.recovery_results.get(recovery_key)
+        if existing is not None:
+            return existing
+
+        context = self.task_contexts.get(task_id)
+        launch = self.launches.get(context.node_index) if context is not None else None
+        plan = self.plans.get(task_id)
+        if (
+            context is None
+            or context.run_id != self.run_id
+            or context.generation != expected_generation
+            or self.generations.get(context.node_index, 0) != expected_generation
+            or launch is None
+            or launch.generation != expected_generation
+            or task_id not in launch.task_ids
+            or plan is None
+            or plan.generation != expected_generation
+            or self.status != RunStatus.RUNNING
+            or self.task_statuses.get(task_id) != TaskStatus.RUNNING
+            or self.current_attempts.get(task_id) != expected_attempt_id
+        ):
+            return None
+
+        wait_id = self.attempt_wait_ids[expected_attempt_id]
+        recovered_attempt_id = self._enqueue_attempt(
+            task_id=task_id,
+            launch_id=launch.id,
+            generation=expected_generation,
+            retry=False,
+            resumed_from_wait_id=wait_id,
+        )
+        self.task_statuses[task_id] = TaskStatus.QUEUED
+        result = TaskRecoveryResult(
+            task_id=task_id,
+            abandoned_attempt_id=expected_attempt_id,
+            recovered_attempt_id=recovered_attempt_id,
+            run_id=self.run_id,
+            node_index=context.node_index,
+            generation=context.generation,
+            resumed_from_wait_id=wait_id,
+        )
+        self.recovery_results[recovery_key] = result
+        self._bump_revision()
+        return result
+
+    def try_wait_task(
+        self,
+        task_id: str,
+        wait_id: str,
+        *,
+        expected_attempt_id: str,
+        expected_generation: int,
+    ) -> TaskWaitResult | None:
+        wait_key = (task_id, wait_id)
+        existing = self.waits.get(wait_key)
+        if existing is not None:
+            result = existing.wait_result
+            if (
+                result.attempt_id == expected_attempt_id
+                and result.generation == expected_generation
+            ):
+                return result
+            return None
+
+        context = self.task_contexts.get(task_id)
+        launch = self.launches.get(context.node_index) if context is not None else None
+        plan = self.plans.get(task_id)
+        if (
+            context is None
+            or context.run_id != self.run_id
+            or context.generation != expected_generation
+            or self.generations.get(context.node_index, 0) != expected_generation
+            or launch is None
+            or launch.generation != expected_generation
+            or task_id not in launch.task_ids
+            or plan is None
+            or plan.generation != expected_generation
+            or self.status != RunStatus.RUNNING
+            or self.task_statuses.get(task_id) != TaskStatus.RUNNING
+            or self.current_attempts.get(task_id) != expected_attempt_id
+            or task_id in self.active_waits
+        ):
+            return None
+
+        result = TaskWaitResult(
+            task_id=task_id,
+            attempt_id=expected_attempt_id,
+            run_id=self.run_id,
+            node_index=context.node_index,
+            generation=context.generation,
+            wait_id=wait_id,
+        )
+        self.waits[wait_key] = _WaitRecord(wait_result=result)
+        self.active_waits[task_id] = wait_id
+        self.task_statuses[task_id] = TaskStatus.WAITING
+        self._bump_revision()
+        return result
+
+    def try_resume_task(
+        self,
+        task_id: str,
+        wait_id: str,
+        *,
+        expected_attempt_id: str,
+        expected_generation: int,
+    ) -> TaskResumeResult | None:
+        record = self.waits.get((task_id, wait_id))
+        if record is None:
+            return None
+        waited = record.wait_result
+        if (
+            waited.attempt_id != expected_attempt_id
+            or waited.generation != expected_generation
+        ):
+            return None
+        if record.resume_result is not None:
+            return record.resume_result
+        if record.state != "active":
+            return None
+
+        context = self.task_contexts.get(task_id)
+        launch = self.launches.get(context.node_index) if context is not None else None
+        plan = self.plans.get(task_id)
+        if (
+            context is None
+            or context.run_id != self.run_id
+            or context.generation != expected_generation
+            or self.generations.get(context.node_index, 0) != expected_generation
+            or launch is None
+            or launch.generation != expected_generation
+            or task_id not in launch.task_ids
+            or plan is None
+            or plan.generation != expected_generation
+            or self.status != RunStatus.RUNNING
+            or self.task_statuses.get(task_id) != TaskStatus.WAITING
+            or self.current_attempts.get(task_id) != expected_attempt_id
+            or self.active_waits.get(task_id) != wait_id
+        ):
+            return None
+
+        resumed_attempt_id = self._enqueue_attempt(
+            task_id=task_id,
+            launch_id=launch.id,
+            generation=expected_generation,
+            retry=False,
+            resumed_from_wait_id=wait_id,
+        )
+        self.task_statuses[task_id] = TaskStatus.QUEUED
+        result = TaskResumeResult(
+            task_id=task_id,
+            waiting_attempt_id=expected_attempt_id,
+            resumed_attempt_id=resumed_attempt_id,
+            run_id=self.run_id,
+            node_index=context.node_index,
+            generation=context.generation,
+            wait_id=wait_id,
+        )
+        record.state = "resolved"
+        record.resume_result = result
+        del self.active_waits[task_id]
+        self._bump_revision()
+        return result
+
     def try_complete_task(
         self,
         task_id: str,
@@ -383,7 +614,7 @@ class FakeStore:
         task_status = self.task_statuses.get(task_id)
         if task_status == TaskStatus.COMPLETED:
             return self.completion_results[task_id]
-        if self.status != RunStatus.RUNNING or task_status in TASK_TERMINAL_STATUSES:
+        if self.status != RunStatus.RUNNING or task_status != TaskStatus.RUNNING:
             return None
 
         validate_output_batch_size(len(outputs))
@@ -479,8 +710,8 @@ class FakeStore:
             or launch.generation != context.generation
             or task_id not in launch.task_ids
             or self.current_attempts.get(task_id) != expected_attempt_id
-            or self.status in RUN_TERMINAL_STATUSES
-            or self.task_statuses.get(task_id) in TASK_TERMINAL_STATUSES
+            or self.status != RunStatus.RUNNING
+            or self.task_statuses.get(task_id) != TaskStatus.RUNNING
         ):
             return None
         self.attempt_errors[expected_attempt_id] = error
@@ -605,6 +836,7 @@ class FakeStore:
             for node_index in self.launches:
                 self._record_settled_launch(node_index)
             for task_id in active_task_ids:
+                self._invalidate_active_wait(task_id)
                 if self.task_statuses[task_id] not in TASK_TERMINAL_STATUSES:
                     self.task_statuses[task_id] = TaskStatus.CANCELLED
                     self.cancelled += 1
@@ -657,6 +889,7 @@ class FakeStore:
             launch_id=launch.id,
             generation=context.generation,
             retry=True,
+            resumed_from_wait_id=self.attempt_wait_ids[expected_attempt_id],
         )
         self.task_statuses[task_id] = TaskStatus.QUEUED
         self.launches[context.node_index] = launch.model_copy(update={"complete": False})
@@ -721,6 +954,7 @@ class FakeStore:
             if launch is not None:
                 self.invalidated_launches.append(launch)
                 for task_id in launch.task_ids:
+                    self._invalidate_active_wait(task_id)
                     plan = self.plans.pop(task_id, None)
                     if plan is not None:
                         self.invalidated_plans[task_id] = plan
@@ -771,3 +1005,15 @@ class CallbackRecorder:
             on_run_crashed=self.crashed.append,
             on_run_cancelled=self.cancelled.append,
         )
+
+
+def claim_current(store: FakeStore, task_id: str) -> TaskClaimResult:
+    context = store.task_contexts[task_id]
+    result = claim_task(
+        store,
+        task_id,
+        expected_attempt_id=store.current_attempts[task_id],
+        expected_generation=context.generation,
+    )
+    assert result is not None
+    return result

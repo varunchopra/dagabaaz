@@ -55,7 +55,7 @@ from dagabaaz.store import (
 from dagabaaz.task_input import resolve_task_inputs
 
 from . import helpers as helpers_module
-from .helpers import CallbackRecorder, FakeStore
+from .helpers import CallbackRecorder, FakeStore, claim_current
 
 
 def linear_nodes() -> list[DagNode]:
@@ -86,6 +86,7 @@ def test_start_and_completion_reconcile_exact_plans() -> None:
     assert store.launches[0].disposition == NodeDisposition.LAUNCHED
     root_task = store.launches[0].task_ids[0]
 
+    claim_current(store, root_task)
     on_task_complete(
         store,
         task_id=root_task,
@@ -104,6 +105,7 @@ def test_start_and_completion_reconcile_exact_plans() -> None:
     ]
 
     for task_id in child_tasks:
+        claim_current(store, task_id)
         on_task_complete(
             store,
             task_id=task_id,
@@ -186,6 +188,7 @@ def test_explicit_slugs_are_resolved_before_snapshot_planning() -> None:
 
     start_run(store, "run", callbacks=recorder.callbacks())
     source_task = store.launches[0].task_ids[0]
+    claim_current(store, source_task)
     on_task_complete(
         store,
         task_id=source_task,
@@ -321,6 +324,7 @@ def test_partial_barrier_waits_for_every_source() -> None:
     start_run(store, "run", callbacks=recorder.callbacks())
 
     left_task = store.launches[0].task_ids[0]
+    claim_current(store, left_task)
     on_task_complete(
         store,
         task_id=left_task,
@@ -331,6 +335,7 @@ def test_partial_barrier_waits_for_every_source() -> None:
     assert 2 not in store.launches
 
     right_task = store.launches[1].task_ids[0]
+    claim_current(store, right_task)
     on_task_complete(
         store,
         task_id=right_task,
@@ -345,6 +350,7 @@ def test_reconcile_launches_a_node_that_was_ready_before_the_call() -> None:
     store = FakeStore(linear_nodes())
     root = store.seed_launch(0)
     root_task = root.task_ids[0]
+    claim_current(store, root_task)
     assert store.try_complete_task(
         root_task,
         (EmittedOutput(id="output"),),
@@ -376,6 +382,7 @@ def test_zero_task_dispositions_complete_and_unlock_downstream() -> None:
     recorder = CallbackRecorder()
     start_run(store, "run", callbacks=recorder.callbacks())
     root_task = store.launches[0].task_ids[0]
+    claim_current(store, root_task)
     on_task_complete(
         store,
         task_id=root_task,
@@ -492,6 +499,7 @@ def test_output_completion_invalidates_an_older_snapshot() -> None:
         max_routing_bytes=MAX_SNAPSHOT_ROUTING_BYTES,
     )
     root_task = root.task_ids[0]
+    claim_current(store, root_task)
     assert store.try_complete_task(
         root_task,
         (EmittedOutput(id="new-output"),),
@@ -515,6 +523,7 @@ def test_task_completion_rejects_duplicate_output_ids_atomically() -> None:
     launch = store.seed_launch(0)
     task_id = launch.task_ids[0]
 
+    claim_current(store, task_id)
     with pytest.raises(OutputPublicationError, match="duplicate output IDs"):
         store.try_complete_task(
             task_id,
@@ -524,7 +533,7 @@ def test_task_completion_rejects_duplicate_output_ids_atomically() -> None:
             ),
             expected_attempt_id=store.current_attempts[task_id],
         )
-    assert store.task_statuses[task_id] == TaskStatus.QUEUED
+    assert store.task_statuses[task_id] == TaskStatus.RUNNING
     assert store.outputs == {}
     assert store.resolved == {}
 
@@ -535,6 +544,7 @@ def test_invalid_output_publication_fails_the_task_and_run() -> None:
     start_run(store, "run", callbacks=recorder.callbacks())
     task_id = store.launches[0].task_ids[0]
 
+    claim_current(store, task_id)
     on_task_complete(
         store,
         task_id=task_id,
@@ -557,6 +567,7 @@ def test_completion_redelivery_repairs_reconciliation_without_republishing() -> 
     attempt_id = store.current_attempts[task_id]
     committed = (EmittedOutput(id="committed", fields={"value": 1}),)
 
+    claim_current(store, task_id)
     result = store.try_complete_task(
         task_id,
         committed,
@@ -583,6 +594,7 @@ def test_task_completion_derives_correlation_and_keeps_data_namespaced() -> None
     launch = store.seed_launch(0)
     task_id = launch.task_ids[0]
 
+    claim_current(store, task_id)
     result = store.try_complete_task(
         task_id,
         (
@@ -608,6 +620,7 @@ def test_output_ids_are_unique_across_tasks_in_a_run() -> None:
     recorder = CallbackRecorder()
     start_run(store, "run", callbacks=recorder.callbacks())
     root_task = store.launches[0].task_ids[0]
+    claim_current(store, root_task)
     on_task_complete(
         store,
         task_id=root_task,
@@ -616,6 +629,7 @@ def test_output_ids_are_unique_across_tasks_in_a_run() -> None:
         callbacks=recorder.callbacks(),
     )
     first, second = store.launches[1].task_ids
+    claim_current(store, first)
     on_task_complete(
         store,
         task_id=first,
@@ -623,6 +637,7 @@ def test_output_ids_are_unique_across_tasks_in_a_run() -> None:
         outputs=(EmittedOutput(id="shared"),),
         callbacks=recorder.callbacks(),
     )
+    claim_current(store, second)
     on_task_complete(
         store,
         task_id=second,
@@ -984,6 +999,7 @@ def test_planning_failure_creates_failed_launch_and_fails_run() -> None:
     recorder = CallbackRecorder()
     start_run(store, "run", callbacks=recorder.callbacks())
     task_id = store.launches[0].task_ids[0]
+    claim_current(store, task_id)
     on_task_complete(
         store,
         task_id=task_id,
@@ -1015,6 +1031,7 @@ def test_each_with_an_uncorrelated_input_fails_during_planning() -> None:
     start_run(store, "run", callbacks=recorder.callbacks())
     source_task = store.launches[0].task_ids[0]
 
+    claim_current(store, source_task)
     on_task_complete(
         store,
         task_id=source_task,
@@ -1079,6 +1096,7 @@ def test_snapshot_limit_creates_a_retryable_failed_launch(
     recorder = CallbackRecorder()
     start_run(store, "run", callbacks=recorder.callbacks())
     source_task = store.launches[0].task_ids[0]
+    claim_current(store, source_task)
     on_task_complete(
         store,
         task_id=source_task,
@@ -1110,6 +1128,7 @@ def test_snapshot_read_returns_one_extra_output_per_edge() -> None:
     store = FakeStore(linear_nodes())
     source = store.seed_launch(0)
     source_task = source.task_ids[0]
+    claim_current(store, source_task)
     assert store.try_complete_task(
         source_task,
         tuple(EmittedOutput(id=f"output-{index}") for index in range(4)),
@@ -1152,6 +1171,7 @@ def test_snapshot_read_returns_one_extra_output_in_total() -> None:
     for node_index in range(3):
         launch = store.seed_launch(node_index)
         task_id = launch.task_ids[0]
+        claim_current(store, task_id)
         assert store.try_complete_task(
             task_id,
             tuple(
@@ -1177,6 +1197,7 @@ def test_snapshot_read_accepts_exact_limits() -> None:
     store = FakeStore(linear_nodes())
     source = store.seed_launch(0)
     source_task = source.task_ids[0]
+    claim_current(store, source_task)
     assert store.try_complete_task(
         source_task,
         (EmittedOutput(id="first"), EmittedOutput(id="second")),
@@ -1221,6 +1242,7 @@ def test_snapshot_read_stops_after_routing_byte_overflow() -> None:
     store = FakeStore(nodes)
     source = store.seed_launch(0)
     source_task = source.task_ids[0]
+    claim_current(store, source_task)
     assert store.try_complete_task(
         source_task,
         tuple(EmittedOutput(id=f"source-{index}") for index in range(3)),
@@ -1228,6 +1250,7 @@ def test_snapshot_read_stops_after_routing_byte_overflow() -> None:
     )
     later = store.seed_launch(1)
     later_task = later.task_ids[0]
+    claim_current(store, later_task)
     assert store.try_complete_task(
         later_task,
         (EmittedOutput(id="later-output"),),
@@ -1272,6 +1295,7 @@ def test_routing_byte_overflow_creates_a_failed_launch(
     start_run(store, "run", callbacks=recorder.callbacks())
     source_task = store.launches[0].task_ids[0]
 
+    claim_current(store, source_task)
     on_task_complete(
         store,
         task_id=source_task,
@@ -1304,6 +1328,7 @@ def test_task_completion_limit_fails_before_persistence(
     start_run(store, "run", callbacks=recorder.callbacks())
     task_id = store.launches[0].task_ids[0]
 
+    claim_current(store, task_id)
     on_task_complete(
         store,
         task_id=task_id,
@@ -1337,6 +1362,7 @@ def test_store_rejects_an_oversized_completion_before_persistence(
         is None
     )
 
+    claim_current(store, task_id)
     with pytest.raises(
         OutputPublicationError,
         match="task completion contains 2 outputs; maximum is 1",
@@ -1347,7 +1373,7 @@ def test_store_rejects_an_oversized_completion_before_persistence(
             expected_attempt_id=store.current_attempts[task_id],
         )
 
-    assert store.task_statuses[task_id] == TaskStatus.QUEUED
+    assert store.task_statuses[task_id] == TaskStatus.RUNNING
     assert store.outputs == {}
     assert store.resolved == {}
 
@@ -1366,6 +1392,7 @@ def test_task_completion_accepts_its_exact_routing_byte_limit(
     launch = store.seed_launch(0)
     task_id = launch.task_ids[0]
 
+    claim_current(store, task_id)
     result = store.try_complete_task(
         task_id,
         (
@@ -1398,6 +1425,7 @@ def test_task_completion_routing_byte_overflow_is_atomic(
     launch = store.seed_launch(0)
     task_id = launch.task_ids[0]
 
+    claim_current(store, task_id)
     with pytest.raises(
         OutputPublicationError,
         match=(
@@ -1410,7 +1438,7 @@ def test_task_completion_routing_byte_overflow_is_atomic(
             expected_attempt_id=store.current_attempts[task_id],
         )
 
-    assert store.task_statuses[task_id] == TaskStatus.QUEUED
+    assert store.task_statuses[task_id] == TaskStatus.RUNNING
     assert store.outputs == {}
     assert store.resolved == {}
     assert store._published_output_ids == set()
@@ -1425,6 +1453,7 @@ def test_oversized_completion_redelivery_repairs_reconciliation(
     start_run(store, "run", callbacks=recorder.callbacks())
     task_id = store.launches[0].task_ids[0]
     attempt_id = store.current_attempts[task_id]
+    claim_current(store, task_id)
     committed = store.try_complete_task(
         task_id,
         (EmittedOutput(id="committed"),),
@@ -1457,6 +1486,7 @@ def test_task_fail_crash_and_abort_callbacks() -> None:
         recorder = CallbackRecorder()
         start_run(store, "run", callbacks=recorder.callbacks())
         task_id = store.launches[0].task_ids[0]
+        claim_current(store, task_id)
         handler(
             store,
             task_id=task_id,
@@ -1499,6 +1529,7 @@ def test_callback_failure_cannot_strand_other_executing_tasks() -> None:
         on_run_cancelled=explode,
     )
     with pytest.raises(RuntimeError, match="callback exploded"):
+        claim_current(store, failed_task)
         on_task_failed(
             store,
             task_id=failed_task,
@@ -1552,6 +1583,7 @@ def test_failure_redelivery_finalises_from_the_persisted_attempt_error() -> None
     task_id = store.launches[0].task_ids[0]
     attempt_id = store.current_attempts[task_id]
 
+    claim_current(store, task_id)
     on_task_failed(
         store,
         task_id=task_id,
@@ -1590,12 +1622,14 @@ def test_terminal_progress_excludes_tasks_cancelled_by_the_transition() -> None:
     failed_task = store.launches[1].task_ids[0]
     cancelled_task = store.launches[2].task_ids[0]
 
+    claim_current(store, completed_task)
     on_task_complete(
         store,
         task_id=completed_task,
         expected_attempt_id=store.current_attempts[completed_task],
         callbacks=recorder.callbacks(),
     )
+    claim_current(store, failed_task)
     on_task_failed(
         store,
         task_id=failed_task,
@@ -1638,6 +1672,7 @@ def test_task_retry_winning_before_terminalisation_keeps_the_run_active() -> Non
     recorder = CallbackRecorder()
     start_run(store, "run", callbacks=recorder.callbacks())
     task_id = store.launches[0].task_ids[0]
+    claim_current(store, task_id)
     on_task_crashed(
         store,
         task_id=task_id,
@@ -1664,6 +1699,7 @@ def test_completion_callback_observes_committed_terminal_state() -> None:
     )
     start_run(store, "run", callbacks=callbacks)
     task_id = store.launches[0].task_ids[0]
+    claim_current(store, task_id)
     on_task_complete(
         store,
         task_id=task_id,
@@ -1697,6 +1733,7 @@ def test_task_completion_does_not_require_retained_task_context() -> None:
     start_run(store, "run", callbacks=recorder.callbacks())
     task_id = store.launches[0].task_ids[0]
 
+    claim_current(store, task_id)
     on_task_complete(
         store,
         task_id=task_id,
@@ -1736,6 +1773,7 @@ def test_completion_terminal_transaction_rechecks_task_state() -> None:
     recorder = CallbackRecorder()
     start_run(store, "run", callbacks=recorder.callbacks())
     task_id = store.launches[0].task_ids[0]
+    claim_current(store, task_id)
     on_task_complete(
         store,
         task_id=task_id,
@@ -1745,6 +1783,7 @@ def test_completion_terminal_transaction_rechecks_task_state() -> None:
     assert store.status == RunStatus.RUNNING
     assert recorder.completed == []
 
+    claim_current(store, task_id)
     on_task_complete(
         store,
         task_id=task_id,
@@ -1759,6 +1798,7 @@ def test_completion_requires_an_active_launch_for_every_stored_node() -> None:
     store = FakeStore(linear_nodes())
     root = store.seed_launch(0)
     root_task = root.task_ids[0]
+    claim_current(store, root_task)
     assert store.try_complete_task(
         root_task,
         (),
@@ -1774,6 +1814,7 @@ def test_completion_rejects_the_wrong_active_launch_indices() -> None:
     root = store.seed_launch(0)
     child = store.seed_launch(1)
     for task_id in (root.task_ids[0], child.task_ids[0]):
+        claim_current(store, task_id)
         assert store.try_complete_task(
             task_id,
             (),
@@ -1819,6 +1860,7 @@ def test_fake_output_resolution_is_run_scoped() -> None:
     store = FakeStore([DagNode(slug="root", plugin="p")])
     launch = store.seed_launch(0)
     task_id = launch.task_ids[0]
+    claim_current(store, task_id)
     assert store.try_complete_task(
         task_id,
         (EmittedOutput(id="output"),),
@@ -1834,6 +1876,7 @@ def test_non_final_task_completions_do_not_reconcile_the_graph() -> None:
     start_run(store, "run", callbacks=recorder.callbacks())
     root_task = store.launches[0].task_ids[0]
     outputs = tuple(EmittedOutput(id=f"output-{index}") for index in range(200))
+    claim_current(store, root_task)
     on_task_complete(
         store,
         task_id=root_task,
@@ -1847,6 +1890,7 @@ def test_non_final_task_completions_do_not_reconcile_the_graph() -> None:
     store.list_node_launches_calls = 0
 
     for task_id in child_tasks[:-1]:
+        claim_current(store, task_id)
         on_task_complete(
             store,
             task_id=task_id,
@@ -1858,6 +1902,7 @@ def test_non_final_task_completions_do_not_reconcile_the_graph() -> None:
     assert store.list_node_launches_calls == 0
 
     final_task = child_tasks[-1]
+    claim_current(store, final_task)
     on_task_complete(
         store,
         task_id=final_task,

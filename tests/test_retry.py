@@ -25,7 +25,7 @@ from dagabaaz.store import (
     TaskAttemptRef,
 )
 
-from .helpers import CallbackRecorder, FakeStore
+from .helpers import CallbackRecorder, FakeStore, claim_current
 
 
 def nodes() -> list[DagNode]:
@@ -67,6 +67,7 @@ def commit_task(
     task_id: str,
     *outputs: EmittedOutput,
 ) -> None:
+    claim_current(store, task_id)
     result = store.try_complete_task(
         task_id,
         tuple(outputs),
@@ -79,6 +80,7 @@ def fail_run_at(store: FakeStore, *node_indices: int) -> None:
     cause = None
     for node_index in node_indices:
         task_id = store.launches[node_index].task_ids[0]
+        claim_current(store, task_id)
         attempt_id = store.current_attempts[task_id]
         assert (
             store.mark_task_failed(
@@ -100,6 +102,7 @@ def test_task_retry_preserves_plan_generation_and_enqueues_a_new_attempt() -> No
     plan = store.plans[task_id]
     predecessor = store.current_attempts[task_id]
     assert predecessor == "attempt-1"
+    claim_current(store, task_id)
     store.mark_task_crashed(
         task_id,
         "transient",
@@ -129,6 +132,7 @@ def test_task_retry_rejects_a_stale_attempt_token() -> None:
     start_run(store, "run", callbacks=CallbackRecorder().callbacks())
     task_id = store.launches[0].task_ids[0]
     first_attempt = store.current_attempts[task_id]
+    claim_current(store, task_id)
     store.mark_task_crashed(
         task_id,
         "transient",
@@ -141,6 +145,7 @@ def test_task_retry_rejects_a_stale_attempt_token() -> None:
     )
     assert second_attempt is not None
 
+    claim_current(store, task_id)
     store.mark_task_crashed(
         task_id,
         "transient again",
@@ -172,6 +177,7 @@ def test_late_attempt_callbacks_cannot_terminate_a_replacement_attempt() -> None
     start_run(store, "run", callbacks=recorder.callbacks())
     task_id = store.launches[0].task_ids[0]
     first_attempt = store.current_attempts[task_id]
+    claim_current(store, task_id)
     assert (
         store.mark_task_crashed(
             task_id,
@@ -207,6 +213,7 @@ def test_late_attempt_callbacks_cannot_terminate_a_replacement_attempt() -> None
     assert recorder.failed == []
     assert recorder.crashed == []
 
+    claim_current(store, task_id)
     on_task_failed(
         store,
         task_id=task_id,
@@ -223,6 +230,7 @@ def test_late_attempt_cannot_complete_a_replacement_attempt() -> None:
     start_run(store, "run", callbacks=CallbackRecorder().callbacks())
     task_id = store.launches[0].task_ids[0]
     first_attempt = store.current_attempts[task_id]
+    claim_current(store, task_id)
     assert (
         store.mark_task_crashed(
             task_id,
@@ -248,6 +256,7 @@ def test_late_attempt_cannot_complete_a_replacement_attempt() -> None:
     )
     assert store.task_statuses[task_id] == TaskStatus.QUEUED
     assert store.outputs == {}
+    claim_current(store, task_id)
     assert (
         store.try_complete_task(
             task_id,
@@ -263,6 +272,7 @@ def test_task_retry_rejects_terminal_run() -> None:
     start_run(store, "run", callbacks=CallbackRecorder().callbacks())
     task_id = store.launches[0].task_ids[0]
     predecessor = store.current_attempts[task_id]
+    claim_current(store, task_id)
     store.mark_task_crashed(
         task_id,
         "transient",
@@ -359,6 +369,7 @@ def test_boundary_retry_replans_work_cancelled_on_a_parallel_branch() -> None:
     reconcile_run(store, "run", callbacks=recorder.callbacks())
     left_task = store.launches[1].task_ids[0]
     right_task = store.launches[2].task_ids[0]
+    claim_current(store, left_task)
     on_task_complete(
         store,
         task_id=left_task,
@@ -366,6 +377,7 @@ def test_boundary_retry_replans_work_cancelled_on_a_parallel_branch() -> None:
         outputs=(EmittedOutput(id="left-output"),),
         callbacks=recorder.callbacks(),
     )
+    claim_current(store, right_task)
     on_task_complete(
         store,
         task_id=right_task,
@@ -373,6 +385,7 @@ def test_boundary_retry_replans_work_cancelled_on_a_parallel_branch() -> None:
         callbacks=recorder.callbacks(),
     )
     leaf_task = store.launches[3].task_ids[0]
+    claim_current(store, leaf_task)
     on_task_complete(
         store,
         task_id=leaf_task,
@@ -390,6 +403,7 @@ def test_invalidated_attempt_history_does_not_block_a_successful_replan() -> Non
     start_run(store, "run", callbacks=recorder.callbacks())
     old_task = store.launches[0].task_ids[0]
     old_attempt = store.current_attempts[old_task]
+    claim_current(store, old_task)
     on_task_failed(
         store,
         task_id=old_task,
@@ -411,6 +425,7 @@ def test_invalidated_attempt_history_does_not_block_a_successful_replan() -> Non
         is None
     )
 
+    claim_current(store, new_task)
     on_task_complete(
         store,
         task_id=new_task,
@@ -434,6 +449,7 @@ def test_snapshot_from_before_a_boundary_retry_is_stale_for_the_new_launch() -> 
     recorder = CallbackRecorder()
     start_run(store, "run", callbacks=recorder.callbacks())
     old_task = store.launches[0].task_ids[0]
+    claim_current(store, old_task)
     on_task_failed(
         store,
         task_id=old_task,
@@ -563,6 +579,7 @@ def test_cancelled_run_restarts_interrupted_work_and_preserves_completed_work() 
     reconcile_run(store, "run", callbacks=recorder.callbacks())
     replacement_task = store.launches[1].task_ids[0]
     assert replacement_task != interrupted_task
+    claim_current(store, replacement_task)
     on_task_complete(
         store,
         task_id=replacement_task,
@@ -609,6 +626,7 @@ def test_cancelled_run_can_reopen_before_any_launch_exists() -> None:
 
     reconcile_run(store, "run", callbacks=recorder.callbacks())
     task_id = store.launches[0].task_ids[0]
+    claim_current(store, task_id)
     on_task_complete(
         store,
         task_id=task_id,
@@ -650,6 +668,7 @@ def test_omitted_boundary_is_accepted_for_a_crashed_run() -> None:
     store.seed_launch(0)
     task_id = store.launches[0].task_ids[0]
     attempt_id = store.current_attempts[task_id]
+    claim_current(store, task_id)
     assert (
         store.mark_task_crashed(
             task_id,
@@ -676,6 +695,7 @@ def test_crashed_run_accepts_a_crashed_boundary() -> None:
     store = FakeStore([DagNode(slug="root", plugin="p")])
     store.seed_launch(0)
     task_id = store.launches[0].task_ids[0]
+    claim_current(store, task_id)
     assert (
         store.mark_task_crashed(
             task_id,
@@ -712,6 +732,7 @@ def test_retry_invalidates_successful_sibling_plans_and_outputs() -> None:
     successful_task, failed_task = store.launches[0].task_ids
     commit_task(store, successful_task, EmittedOutput(id="published"))
     failed_attempt = store.current_attempts[failed_task]
+    claim_current(store, failed_task)
     assert (
         store.mark_task_failed(
             failed_task,
@@ -738,6 +759,7 @@ def test_retry_invalidates_successful_sibling_plans_and_outputs() -> None:
 
     reconcile_run(store, "run", callbacks=CallbackRecorder().callbacks())
     replacement_task = store.launches[0].task_ids[0]
+    claim_current(store, replacement_task)
     with pytest.raises(OutputPublicationError, match="already exist"):
         store.try_complete_task(
             replacement_task,
